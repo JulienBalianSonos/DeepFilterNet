@@ -1,29 +1,129 @@
+import math
 from collections import OrderedDict
-from typing import List, Optional, Tuple
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from icecream import ic  # noqa
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.nn import init
+from torch.nn.parameter import Parameter
 from typing_extensions import Final
 
-from df.config import config
 from df.model import ModelParams
-from df.utils import as_complex, as_real, get_norm_alpha
+from df.utils import as_complex, as_real, get_device, get_norm_alpha
 from libdf import unit_norm_init
 
 
-def get_device():
-    s = config("DEVICE", default="", section="train")
-    if s == "":
-        if torch.cuda.is_available():
-            DEVICE = torch.device("cuda:0")
+class Conv2dNormAct(nn.Sequential):
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: Union[int, Iterable[int]],
+        fstride: int = 1,
+        dilation: int = 1,
+        fpad: bool = True,
+        bias: bool = True,
+        separable: bool = False,
+        norm_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.BatchNorm2d,
+        activation_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.ReLU,
+    ):
+        """Causal Conv2d by delaying the signal for any lookahead.
+
+        Expected input format: [B, C, T, F]
+        """
+        lookahead = 0  # This needs to be handled on the input feature side
+        # Padding on time axis
+        kernel_size = (
+            (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+        )
+        if fpad:
+            fpad_ = kernel_size[1] // 2 + dilation - 1
         else:
-            DEVICE = torch.device("cpu")
-    else:
-        DEVICE = torch.device(s)
-    return DEVICE
+            fpad_ = 0
+        pad = (0, 0, kernel_size[0] - 1 - lookahead, lookahead)
+        layers = []
+        if any(x > 0 for x in pad):
+            layers.append(nn.ConstantPad2d(pad, 0.0))
+        groups = math.gcd(in_ch, out_ch) if separable else 1
+        if groups == 1:
+            separable = False
+        if max(kernel_size) == 1:
+            separable = False
+        layers.append(
+            nn.Conv2d(
+                in_ch,
+                out_ch,
+                kernel_size=kernel_size,
+                padding=(0, fpad_),
+                stride=(1, fstride),  # Stride over time is always 1
+                dilation=(1, dilation),  # Same for dilation
+                groups=groups,
+                bias=bias,
+            )
+        )
+        if separable:
+            layers.append(nn.Conv2d(out_ch, out_ch, kernel_size=1, bias=False))
+        if norm_layer is not None:
+            layers.append(norm_layer(out_ch))
+        if activation_layer is not None:
+            layers.append(activation_layer())
+        super().__init__(*layers)
+
+
+class ConvTranspose2dNormAct(nn.Sequential):
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: Union[int, Tuple[int, int]],
+        fstride: int = 1,
+        dilation: int = 1,
+        fpad: bool = True,
+        bias: bool = True,
+        separable: bool = False,
+        norm_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.BatchNorm2d,
+        activation_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.ReLU,
+    ):
+        """Causal ConvTranspose2d.
+
+        Expected input format: [B, C, T, F]
+        """
+        # Padding on time axis, with lookahead = 0
+        lookahead = 0  # This needs to be handled on the input feature side
+        kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        if fpad:
+            fpad_ = kernel_size[1] // 2
+        else:
+            fpad_ = 0
+        pad = (0, 0, kernel_size[0] - 1 - lookahead, lookahead)
+        layers = []
+        if any(x > 0 for x in pad):
+            layers.append(nn.ConstantPad2d(pad, 0.0))
+        groups = math.gcd(in_ch, out_ch) if separable else 1
+        if groups == 1:
+            separable = False
+        layers.append(
+            nn.ConvTranspose2d(
+                in_ch,
+                out_ch,
+                kernel_size=kernel_size,
+                padding=(kernel_size[0] - 1, fpad_ + dilation - 1),
+                output_padding=(0, fpad_),
+                stride=(1, fstride),  # Stride over time is always 1
+                dilation=(1, dilation),
+                groups=groups,
+                bias=bias,
+            )
+        )
+        if separable:
+            layers.append(nn.Conv2d(out_ch, out_ch, kernel_size=1, bias=False))
+        if norm_layer is not None:
+            layers.append(norm_layer(out_ch))
+        if activation_layer is not None:
+            layers.append(activation_layer())
+        super().__init__(*layers)
 
 
 def convkxf(
@@ -133,6 +233,14 @@ class Mask(nn.Module):
         self.eps = eps
 
     def pf(self, mask: Tensor, beta: float = 0.02) -> Tensor:
+        """Post-Filter proposed by Valin et al. [1].
+
+        Args:
+            mask (Tensor): Real valued mask, typically of shape [B, C, T, F].
+            beta: Global gain factor.
+        Refs:
+            [1]: Valin et al.: A Perceptually-Motivated Approach for Low-Complexity, Real-Time Enhancement of Fullband Speech.
+        """
         mask_sin = mask * torch.sin(np.pi * mask / 2)
         mask_pf = (1 + beta) * mask / (1 + beta * mask.div(mask_sin.clamp_min(self.eps)).pow(2))
         return mask_pf
@@ -234,6 +342,10 @@ class GroupedGRULayer(nn.Module):
             (nn.GRU(self.input_size, self.hidden_size, **kwargs) for _ in range(groups))
         )
 
+    def flatten_parameters(self):
+        for layer in self.layers:
+            layer.flatten_parameters()
+
     def get_h0(self, batch_size: int = 1, device: torch.device = torch.device("cpu")):
         return torch.zeros(
             self.groups * self.num_directions,
@@ -297,6 +409,8 @@ class GroupedGRU(nn.Module):
         }
         assert input_size % groups == 0
         assert hidden_size % groups == 0
+        assert num_layers > 0
+        self.input_size = input_size
         self.groups = groups
         self.num_layers = num_layers
         self.batch_first = batch_first
@@ -312,6 +426,11 @@ class GroupedGRU(nn.Module):
         self.grus.append(GroupedGRULayer(input_size, hidden_size, **kwargs))
         for _ in range(1, num_layers):
             self.grus.append(GroupedGRULayer(hidden_size, hidden_size, **kwargs))
+        self.flatten_parameters()
+
+    def flatten_parameters(self):
+        for gru in self.grus:
+            gru.flatten_parameters()
 
     def get_h0(self, batch_size: int, device: torch.device = torch.device("cpu")) -> Tensor:
         return torch.zeros(
@@ -342,6 +461,77 @@ class GroupedGRU(nn.Module):
                 output = input
         outstate = torch.cat(outstates, dim=0)
         return output, outstate
+
+
+class SqueezedGRU(nn.Module):
+    input_size: Final[int]
+    hidden_size: Final[int]
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        output_size: Optional[int] = None,
+        num_layers: int = 1,
+        linear_groups: int = 8,
+        batch_first: bool = True,
+        gru_skip_op: Optional[Callable[..., torch.nn.Module]] = None,
+        linear_act_layer: Callable[..., torch.nn.Module] = nn.Identity,
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.linear_in = nn.Sequential(
+            GroupedLinearEinsum(input_size, hidden_size, linear_groups), linear_act_layer()
+        )
+        self.gru = nn.GRU(hidden_size, hidden_size, num_layers=num_layers, batch_first=batch_first)
+        self.gru_skip = gru_skip_op() if gru_skip_op is not None else None
+        if output_size is not None:
+            self.linear_out = nn.Sequential(
+                GroupedLinearEinsum(hidden_size, output_size, linear_groups), linear_act_layer()
+            )
+        else:
+            self.linear_out = nn.Identity()
+
+    def forward(self, input: Tensor, h=None) -> Tuple[Tensor, Tensor]:
+        input = self.linear_in(input)
+        x, h = self.gru(input, h)
+        if self.gru_skip is not None:
+            x = x + self.gru_skip(input)
+        x = self.linear_out(x)
+        return x, h
+
+
+class GroupedLinearEinsum(nn.Module):
+    input_size: Final[int]
+    hidden_size: Final[int]
+    groups: Final[int]
+
+    def __init__(self, input_size: int, hidden_size: int, groups: int = 1):
+        super().__init__()
+        # self.weight: Tensor
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.groups = groups
+        assert input_size % groups == 0
+        self.ws = input_size // groups
+        self.register_parameter(
+            "weight",
+            Parameter(
+                torch.zeros(groups, input_size // groups, hidden_size // groups), requires_grad=True
+            ),
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))  # type: ignore
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [..., I]
+        x = x.unflatten(-1, (self.groups, self.ws))  # [..., G, I/G]
+        x = torch.einsum("...gi,...gih->...gh", x, self.weight)  # [..., G, H/G]
+        x = x.flatten(2, 3)  # [B, T, H]
+        return x
 
 
 class GroupedLinear(nn.Module):
@@ -441,6 +631,8 @@ def local_snr(
 
 
 def test_grouped_gru():
+    from icecream import ic
+
     g = 2  # groups
     h = 4  # hidden_size
     i = 2  # input_size
@@ -489,26 +681,29 @@ def test_grouped_gru():
 
 
 def test_erb():
-    import df
+    import libdf
+    from df.config import config
 
     config.use_defaults()
     p = ModelParams()
     n_freq = p.fft_size // 2 + 1
-    df_state = df.DF(sr=p.sr, fft_size=p.fft_size, hop_size=p.hop_size, nb_bands=p.nb_erb)
+    df_state = libdf.DF(sr=p.sr, fft_size=p.fft_size, hop_size=p.hop_size, nb_bands=p.nb_erb)
     erb = erb_fb(df_state.erb_widths(), p.sr)
     erb_inverse = erb_fb(df_state.erb_widths(), p.sr, inverse=True)
     input = torch.randn((1, 1, 1, n_freq), dtype=torch.complex64)
     input_abs = input.abs().square()
-    df_erb = torch.from_numpy(df.erb(input.numpy(), p.nb_erb, False))
+    erb_widths = df_state.erb_widths()
+    df_erb = torch.from_numpy(libdf.erb(input.numpy(), erb_widths, False))
     py_erb = torch.matmul(input_abs, erb)
     assert torch.allclose(df_erb, py_erb)
-    df_out = torch.from_numpy(df.erb_inv(df_erb.numpy()))
+    df_out = torch.from_numpy(libdf.erb_inv(df_erb.numpy(), erb_widths))
     py_out = torch.matmul(py_erb, erb_inverse)
     assert torch.allclose(df_out, py_out)
 
 
 def test_unit_norm():
-    import df
+    from df.config import config
+    from libdf import unit_norm
 
     config.use_defaults()
     p = ModelParams()
@@ -518,9 +713,51 @@ def test_unit_norm():
     spec = torch.randn(b, 1, t, F, 2)
     alpha = get_norm_alpha(log=False)
     # Expects complex input of shape [C, T, F]
-    norm_lib = torch.as_tensor(df.unit_norm(torch.view_as_complex(spec).squeeze(1).numpy(), alpha))
+    norm_lib = torch.as_tensor(unit_norm(torch.view_as_complex(spec).squeeze(1).numpy(), alpha))
     m = ExponentialUnitNorm(alpha, F)
     norm_torch = torch.view_as_complex(m(spec).squeeze(1))
-    torch.testing.assert_allclose(norm_lib.real, norm_torch.real)
-    torch.testing.assert_allclose(norm_lib.imag, norm_torch.imag)
-    torch.testing.assert_allclose(norm_lib.abs(), norm_torch.abs())
+    assert torch.allclose(norm_lib.real, norm_torch.real)
+    assert torch.allclose(norm_lib.imag, norm_torch.imag)
+    assert torch.allclose(norm_lib.abs(), norm_torch.abs())
+
+
+def test_dfop():
+    from df.config import config
+
+    config.use_defaults()
+    p = ModelParams()
+    f = p.nb_df
+    F = f * 2
+    o = p.df_order
+    d = p.df_lookahead
+    t = 100
+    spec = torch.randn(1, 1, t, F, 2)
+    coefs = torch.randn(1, t, o, f, 2)
+    alpha = torch.randn(1, t, 1)
+    dfop = DfOp(df_bins=p.nb_df)
+    dfop.set_forward("real_loop")
+    out1 = dfop(spec, coefs, alpha)
+    dfop.set_forward("real_strided")
+    out2 = dfop(spec, coefs, alpha)
+    dfop.set_forward("real_unfold")
+    out3 = dfop(spec, coefs, alpha)
+    dfop.set_forward("complex_strided")
+    out4 = dfop(spec, coefs, alpha)
+    torch.testing.assert_allclose(out1, out2)
+    torch.testing.assert_allclose(out1, out3)
+    torch.testing.assert_allclose(out1, out4)
+    # This forward method requires external padding/lookahead as well as spectrogram buffer
+    # handling, i.e. via a ring buffer. Could be used in real time usage.
+    dfop.set_forward("real_one_step")
+    spec_padded = spec_pad(spec, o, d, dim=-3)
+    out5 = torch.zeros_like(out1)
+    for i in range(t):
+        out5[:, :, i] = dfop(
+            spec_padded[:, :, i : i + o], coefs[:, i].unsqueeze(1), alpha[:, i].unsqueeze(1)
+        )
+    torch.testing.assert_allclose(out1, out5)
+    # Forward method that does the padding/lookahead handling using an internal hidden state.
+    dfop.freq_bins = F
+    dfop.set_forward("real_hidden_state_loop")
+    out6 = dfop(spec, coefs, alpha)
+    torch.testing.assert_allclose(out1, out6)

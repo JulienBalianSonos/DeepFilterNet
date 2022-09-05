@@ -2,9 +2,11 @@ from typing import List, Tuple
 
 import numpy as np
 import torch
-import torchaudio
+from loguru import logger
 from torch import Tensor
 from torch.nn import functional as F
+
+from df.utils import resample
 
 EPS = np.finfo("float").eps
 
@@ -183,13 +185,16 @@ def stoi(x, y, fs_source):
     obm, _ = thirdoct(fs, N_fft, N_bands, min_freq)  # [N_fft//2-1, N_bands]
     obm = torch.from_numpy(obm).to(x)
 
-    x = torchaudio.functional.resample(x, fs_source, fs)
-    y = torchaudio.functional.resample(y, fs_source, fs)
+    x = resample(x, fs_source, fs)
+    y = resample(y, fs_source, fs)
 
     x_, y_ = remove_silent_frames(x, y, dyn_range, N_frame, N_frame // 2)
 
     for i in range(B):
         # To spectral domain
+        if x_[i].numel() < N_fft:
+            logger.warning("Could not calculate STOI (not enough frames left). Skipping.")
+            continue
         x = _stft(x_[i], win_size=N_frame, fft_size=N_fft, hop_size=N_frame // 2)
         y = _stft(y_[i], win_size=N_frame, fft_size=N_fft, hop_size=N_frame // 2)
         # Power spectrogram

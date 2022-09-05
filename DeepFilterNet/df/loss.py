@@ -1,17 +1,16 @@
 import warnings
 from collections import defaultdict
-from typing import Dict, Final, List, Optional
+from typing import Dict, Final, Iterable, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.autograd import Function
 
-from df.config import config
+from df.config import Csv, config
 from df.model import ModelParams
 from df.modules import LocalSnrTarget, erb_fb
 from df.stoi import stoi
-from df.utils import as_complex
+from df.utils import angle, as_complex, get_device
 from libdf import DF
 
 
@@ -35,25 +34,37 @@ def iam(S: Tensor, X: Tensor, eps: float = 1e-10) -> Tensor:
     return (SS_mag / (XX_mag + eps)).clamp(0, 1)
 
 
-class angle(Function):
-    """Similar to torch.angle but robustify the gradient for zero magnitude."""
+class Stft(nn.Module):
+    def __init__(self, n_fft: int, hop: Optional[int] = None, window: Optional[Tensor] = None):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop = hop or n_fft // 4
+        if window is not None:
+            assert window.shape[0] == n_fft
+        else:
+            window = torch.hann_window(self.n_fft)
+        self.w: torch.Tensor
+        self.register_buffer("w", window)
 
-    @staticmethod
-    def forward(ctx, x: Tensor):
-        ctx.save_for_backward(x)
-        return torch.atan2(x.imag, x.real)
-
-    @staticmethod
-    def backward(ctx, grad: Tensor):
-        (x,) = ctx.saved_tensors
-        grad_inv = grad / (x.real.square() + x.imag.square()).clamp_min_(1e-12)
-        return torch.view_as_complex(torch.stack((-x.imag * grad_inv, x.real * grad_inv), dim=-1))
+    def forward(self, input: Tensor):
+        # Time-domain input shape: [B, *, T]
+        t = input.shape[-1]
+        sh = input.shape[:-1]
+        out = torch.stft(
+            input.reshape(-1, t),
+            n_fft=self.n_fft,
+            hop_length=self.hop,
+            window=self.w,
+            normalized=True,
+            return_complex=True,
+        )
+        out = out.view(*sh, *out.shape[-2:])
+        return out
 
 
 class Istft(nn.Module):
-    def __init__(self, sr: int, n_fft_inv: int, hop_inv: int, window_inv: Tensor):
+    def __init__(self, n_fft_inv: int, hop_inv: int, window_inv: Tensor):
         super().__init__()
-        self.sr = sr
         # Synthesis back to time domain
         self.n_fft_inv = n_fft_inv
         self.hop_inv = hop_inv
@@ -62,18 +73,64 @@ class Istft(nn.Module):
         self.register_buffer("w_inv", window_inv)
 
     def forward(self, input: Tensor):
-        # Input shape: [B (C) T, F, (2)]
+        # Input shape: [B, * T, F, (2)]
         input = as_complex(input)
         t, f = input.shape[-2:]
+        sh = input.shape[:-2]
         # Even though this is not the DF implementation, it numerical sufficiently close.
         # Pad one extra step at the end to get original signal length
-        return torch.istft(
-            F.pad(input.view(-1, t, f).transpose(1, 2), (0, 1)),
+        out = torch.istft(
+            F.pad(input.reshape(-1, t, f).transpose(1, 2), (0, 1)),
             n_fft=self.n_fft_inv,
             hop_length=self.hop_inv,
             window=self.w_inv,
             normalized=True,
         )
+        if input.ndim > 2:
+            out = out.view(*sh, out.shape[-1])
+        return out
+
+
+class MultiResSpecLoss(nn.Module):
+    gamma: Final[float]
+    f: Final[float]
+    f_complex: Final[Optional[List[float]]]
+
+    def __init__(
+        self,
+        n_ffts: Iterable[int],
+        gamma: float = 1,
+        factor: float = 1,
+        f_complex: Optional[Union[float, Iterable[float]]] = None,
+    ):
+        super().__init__()
+        self.gamma = gamma
+        self.f = factor
+        self.stfts = nn.ModuleDict({str(n_fft): Stft(n_fft) for n_fft in n_ffts})
+        if f_complex is None or f_complex == 0:
+            self.f_complex = None
+        elif isinstance(f_complex, Iterable):
+            self.f_complex = list(f_complex)
+        else:
+            self.f_complex = [f_complex] * len(self.stfts)
+
+    def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        loss = torch.zeros((), device=input.device, dtype=input.dtype)
+        for i, stft in enumerate(self.stfts.values()):
+            Y = stft(input)
+            S = stft(target)
+            Y_abs = Y.abs()
+            S_abs = S.abs()
+            if self.gamma != 1:
+                Y_abs = Y_abs.clamp_min(1e-12).pow(self.gamma)
+                S_abs = S_abs.clamp_min(1e-12).pow(self.gamma)
+            loss += F.mse_loss(Y_abs, S_abs) * self.f
+            if self.f_complex is not None:
+                if self.gamma != 1:
+                    Y = Y_abs * torch.exp(1j * angle.apply(Y))
+                    S = S_abs * torch.exp(1j * angle.apply(S))
+                loss += F.mse_loss(torch.view_as_real(Y), torch.view_as_real(S)) * self.f_complex[i]
+        return loss
 
 
 class SpectralLoss(nn.Module):
@@ -81,12 +138,7 @@ class SpectralLoss(nn.Module):
     f_m: Final[float]
     f_c: Final[float]
 
-    def __init__(
-        self,
-        gamma: float = 1,
-        factor_magnitude: float = 1,
-        factor_complex: float = 1,
-    ):
+    def __init__(self, gamma: float = 1, factor_magnitude: float = 1, factor_complex: float = 1):
         super().__init__()
         self.gamma = gamma
         self.f_m = factor_magnitude
@@ -248,6 +300,9 @@ class SiSdr(nn.Module):
     def forward(self, input: Tensor, target: Tensor):
         # Input shape: [B, T]
         eps = torch.finfo(input.dtype).eps
+        t = input.shape[-1]
+        target = target.reshape(-1, t)
+        input = input.reshape(-1, t)
         # Einsum for batch vector dot product
         Rss: Tensor = torch.einsum("bi,bi->b", target, target).unsqueeze(-1)
         a: Tensor = torch.einsum("bi,bi->b", target, input).add(eps).unsqueeze(-1) / Rss.add(eps)
@@ -275,9 +330,8 @@ class SdrLoss(nn.Module):
 
 
 class SegSdrLoss(nn.Module):
-    def __init__(
-        self, window_sizes: Optional[List[int]] = None, factor: float = 0.2, overlap: float = 0
-    ):
+    def __init__(self, window_sizes: List[int], factor: float = 0.2, overlap: float = 0):
+        # Window size in samples
         super().__init__()
         self.window_sizes = window_sizes
         self.factor = factor
@@ -289,25 +343,35 @@ class SegSdrLoss(nn.Module):
         if self.factor == 0:
             return torch.zeros((), device=input.device)
         loss = torch.zeros((), device=input.device)
-        if self.window_sizes is None:
-            # Non-segmental SdrLoss
-            loss = self.sdr(input, target).mean()
-        else:
-            for ws in self.window_sizes:
-                if ws > input.size(1):
-                    warnings.warn("Input size smaller than window size. Adjusting window size.")
-                    ws = input.size(1)
-                loss += self.sdr(
-                    input=input.unfold(1, ws, int(self.hop * ws)).reshape(-1, ws),
-                    target=target.unfold(1, ws, int(self.hop * ws)).reshape(-1, ws),
-                ).mean()
+        for ws in self.window_sizes:
+            if ws > input.size(-1):
+                warnings.warn(
+                    f"Input size {input.size(-1)} smaller than window size. Adjusting window size."
+                )
+                ws = input.size(1)
+            loss += self.sdr(
+                input=input.unfold(-1, ws, int(self.hop * ws)).reshape(-1, ws),
+                target=target.unfold(-1, ws, int(self.hop * ws)).reshape(-1, ws),
+            ).mean()
         return -loss * self.factor
+
+
+class LocalSnrLoss(nn.Module):
+    def __init__(self, factor: float = 1):
+        super().__init__()
+        self.factor = factor
+
+    def forward(self, input: Tensor, target_lsnr: Tensor):
+        # input (freq-domain): [B, T, 1]
+        input = input.squeeze(-1)
+        return F.mse_loss(input, target_lsnr) * self.factor
 
 
 class Loss(nn.Module):
     ml_f: Final[float]
     cal_f: Final[float]
     sl_f: Final[float]
+    mrsl_f: Final[float]
 
     def __init__(self, state: DF, istft: Optional[Istft] = None):
         super().__init__()
@@ -320,7 +384,7 @@ class Loss(nn.Module):
         self.store_losses = False
         self.summaries: Dict[str, List[Tensor]] = self.reset_summaries()
         # Mask Loss
-        self.ml_f = config("factor", 1, float, section="MaskLoss")
+        self.ml_f = config("factor", 0, float, section="MaskLoss")  # e.g. 1
         self.ml_gamma = config("gamma", 0.6, float, section="MaskLoss")
         self.ml_gamma_pred = config("gamma_pred", 0.6, float, section="MaskLoss")
         self.ml_f_under = config("f_under", 2, float, section="MaskLoss")
@@ -335,11 +399,11 @@ class Loss(nn.Module):
             powers=[2, 4],
         )
         # DfAlphaLoss
-        self.cal_f = config("factor", 1e3, float, section="DfAlphaLoss")
+        self.cal_f = config("factor", 0, float, section="DfAlphaLoss")  # e.g. 1e3
         self.cal = DfAlphaLoss(self.cal_f) if self.cal_f > 0 else None
         # SpectralLoss
-        self.sl_fm = config("factor_magnitude", 1e6, float, section="SpectralLoss")
-        self.sl_fc = config("factor_complex", 1e6, float, section="SpectralLoss")
+        self.sl_fm = config("factor_magnitude", 0, float, section="SpectralLoss")  # e.g. 1e4
+        self.sl_fc = config("factor_complex", 0, float, section="SpectralLoss")
         self.sl_gamma = config("gamma", 1, float, section="SpectralLoss")
         self.sl_f = self.sl_fm + self.sl_fc
         if self.sl_f > 0:
@@ -348,6 +412,27 @@ class Loss(nn.Module):
             )
         else:
             self.sl = None
+        # Multi Resolution Spectrogram Loss
+        self.mrsl_f = config("factor", 0, float, section="MultiResSpecLoss")
+        self.mrsl_fc = config("factor_complex", 0, float, section="MultiResSpecLoss")
+        self.mrsl_gamma = config("gamma", 1, float, section="MultiResSpecLoss")
+        self.mrsl_ffts: List[int] = config("fft_sizes", [512, 1024, 2048], Csv(int), section="MultiResSpecLoss")  # type: ignore
+        if self.mrsl_f > 0:
+            assert istft is not None
+            self.mrsl = MultiResSpecLoss(self.mrsl_ffts, self.mrsl_gamma, self.mrsl_f, self.mrsl_fc)
+        else:
+            self.mrsl = None
+        self.sdrl_f = config("factor", 0, float, section="SdrLoss")
+        self.sdrl = None
+        if self.sdrl_f > 0:
+            sdr_sgemental_ws = config("segmental_ws", [], Csv(int), section="SdrLoss")
+            if len(sdr_sgemental_ws) > 0 and any(ws > 0 for ws in sdr_sgemental_ws):
+                self.sdrl = SegSdrLoss(sdr_sgemental_ws, factor=self.sdrl_f)
+            else:
+                self.sdrl = SdrLoss(self.sdrl_f)
+        self.lsnr_f = config("factor", 0.0005, float, section="LocalSnrLoss")
+        self.lsnrl = LocalSnrLoss(self.lsnr_f) if self.lsnr_f > 0 else None
+        self.dev_str = get_device().type
 
     def forward(
         self,
@@ -356,9 +441,10 @@ class Loss(nn.Module):
         enhanced: Tensor,
         mask: Tensor,
         lsnr: Tensor,
-        df_alpha: Tensor,
+        df_alpha: Optional[Tensor],
         snrs: Tensor,
         max_freq: Optional[Tensor] = None,
+        multi_stage_specs: List[Tensor] = [],
     ):
         max_bin: Optional[Tensor] = None
         if max_freq is not None:
@@ -367,31 +453,75 @@ class Loss(nn.Module):
                 .mul(self.fft_size)
                 .div(self.sr, rounding_mode="trunc")
             ).long()
+        enhanced_td = None
+        clean_td = None
+        multi_stage = None
+        multi_stage_td = None
+        if multi_stage_specs:
+            # Stack spectrograms in a channel dimension
+            multi_stage = as_complex(torch.stack(multi_stage_specs, dim=1))
+        lsnr_gt = self.lsnr(clean, noise=noisy - clean)
+        if self.istft is not None:
+            if self.store_losses or self.mrsl is not None or self.sdrl is not None:
+                enhanced_td = self.istft(enhanced)
+                clean_td = self.istft(clean)
+                if multi_stage is not None:
+                    # leave out erb enhanced
+                    multi_stage_td = self.istft(multi_stage)
 
-        ml, sl, cal = [torch.zeros((), device=clean.device)] * 3
+        ml, sl, mrsl, cal, sdrl, lsnrl = [torch.zeros((), device=clean.device)] * 6
         if self.ml_f != 0 and self.ml is not None:
             ml = self.ml(input=mask, clean=clean, noisy=noisy, max_bin=max_bin)
         if self.sl_f != 0 and self.sl is not None:
-            sl = self.sl(input=enhanced, target=clean)
-        if self.cal_f != 0 and self.cal is not None:
+            sl = torch.zeros((), device=clean.device)
+            if multi_stage is not None:
+                sl += self.sl(input=multi_stage, target=clean.expand_as(multi_stage))
+            else:
+                sl = self.sl(input=enhanced, target=clean)
+        if self.mrsl_f > 0 and self.mrsl is not None:
+            if multi_stage_td is not None:
+                ms = multi_stage_td[:, 1:]
+                mrsl = self.mrsl(ms, clean_td.expand_as(ms))
+            else:
+                mrsl = self.mrsl(enhanced_td, clean_td)
+        if self.lsnr_f != 0:
+            lsnrl = self.lsnrl(input=lsnr, target_lsnr=lsnr_gt)
+        if self.cal_f != 0 and self.cal is not None and df_alpha is not None:
             lsnr_gt = self.lsnr(clean, noise=noisy - clean, max_bin=self.nb_df)
             cal = self.cal(df_alpha, target_lsnr=lsnr_gt)
+        if self.sdrl_f != 0:
+            if multi_stage_td is not None:
+                ms = multi_stage_td[:, 1:]
+                sdrl = self.sdrl(ms, clean_td.expand_as(ms))
+            else:
+                sdrl = self.sdrl(enhanced_td, clean_td)
         if self.store_losses and self.istft is not None:
-            enhanced_td = self.istft(enhanced)
-            clean_td = self.istft(clean)
-            self.store_summaries(enhanced_td, clean_td, snrs, ml, sl, cal)
-        return ml + sl + cal
+            assert enhanced_td is not None
+            assert clean_td is not None
+            self.store_summaries(
+                enhanced_td,
+                clean_td,
+                snrs,
+                ml,
+                sl,
+                mrsl,
+                sdrl,
+                lsnrl,
+                cal,
+                multi_stage_td=multi_stage_td,
+            )
+        return ml + sl + mrsl + sdrl + lsnrl + cal
 
     def reset_summaries(self):
         self.summaries = defaultdict(list)
         return self.summaries
 
-    @torch.jit.ignore
+    @torch.jit.ignore  # type: ignore
     def get_summaries(self):
         return self.summaries.items()
 
     @torch.no_grad()
-    @torch.jit.ignore
+    @torch.jit.ignore  # type: ignore
     def store_summaries(
         self,
         enh_td: Tensor,
@@ -399,24 +529,50 @@ class Loss(nn.Module):
         snrs: Tensor,
         ml: Tensor,
         sl: Tensor,
+        mrsl: Tensor,
+        sdrl: Tensor,
+        lsnrl: Tensor,
         cal: Tensor,
+        multi_stage_td: Optional[Tensor] = None,
     ):
         if ml != 0:
             self.summaries["MaskLoss"].append(ml.detach())
         if sl != 0:
             self.summaries["SpectralLoss"].append(sl.detach())
+        if mrsl != 0:
+            self.summaries["MultiResSpecLoss"].append(mrsl.detach())
+        if sdrl != 0:
+            self.summaries["SdrLoss"].append(sdrl.detach())
         if cal != 0:
             self.summaries["DfAlphaLoss"].append(cal.detach())
+        if lsnrl != 0:
+            self.summaries["LocalSnrLoss"].append(lsnrl.detach())
         sdr = SiSdr()
-        sdr_vals: Tensor = sdr(enh_td.detach(), target=clean_td.detach())
-        stoi_vals: Tensor = stoi(y=enh_td.detach(), x=clean_td.detach(), fs_source=self.sr)
+        enh_td = enh_td.squeeze(1).detach()
+        clean_td = clean_td.squeeze(1).detach()
+        sdr_vals: Tensor = sdr(enh_td, target=clean_td)
+        stoi_vals: Tensor = stoi(y=enh_td, x=clean_td, fs_source=self.sr)
+        sdr_vals_ms, stoi_vals_ms = [], []
+        if multi_stage_td is not None:
+            for i in range(multi_stage_td.shape[1]):
+                sdr_vals_ms.append(sdr(multi_stage_td[:, i].detach(), clean_td))
+                stoi_vals_ms.append(
+                    stoi(y=multi_stage_td[:, i].detach(), x=clean_td, fs_source=self.sr)
+                )
         for snr in torch.unique(snrs, sorted=False):
             self.summaries[f"sdr_snr_{snr.item()}"].extend(
-                sdr_vals.masked_select(snr == snrs).split(1)
+                sdr_vals.masked_select(snr == snrs).detach().split(1)
             )
             self.summaries[f"stoi_snr_{snr.item()}"].extend(
-                stoi_vals.masked_select(snr == snrs).split(1)
+                stoi_vals.masked_select(snr == snrs).detach().split(1)
             )
+            for i, (sdr_i, stoi_i) in enumerate(zip(sdr_vals_ms, stoi_vals_ms)):
+                self.summaries[f"sdr_stage_{i}_snr_{snr.item()}"].extend(
+                    sdr_i.masked_select(snr == snrs).detach().split(1)
+                )
+                self.summaries[f"stoi_stage_{i}_snr_{snr.item()}"].extend(
+                    stoi_i.masked_select(snr == snrs).detach().split(1)
+                )
 
 
 def test_local_snr():

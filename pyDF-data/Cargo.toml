@@ -1,6 +1,6 @@
 [package]
 name = "DeepFilterDataLoader"
-version = "0.1.5"
+version = "0.2.6-pre"
 authors = ["Hendrik Schröter <h.schroeter@pm.me>"]
 edition = "2021"
 
@@ -10,7 +10,11 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-df = { path = "../libDF", features = ["dataset"] }
-pyo3 = { version = "^0.15", default_features = true, features = ["extension-module"]}
-numpy = "^0.15"
+deep_filter = { features = ["dataset", "vorbis", "flac"], path = "../libDF" }
+pyo3 = { version = "^0.17", default_features = true, features = [
+  "extension-module",
+] }
+log = { version = "0.4", features = ["std"] }
+crossbeam-channel = "^0.5"
+numpy = "^0.17"
 ndarray = "^0.15"

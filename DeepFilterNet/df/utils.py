@@ -3,17 +3,31 @@ import math
 import os
 import random
 import subprocess
-import warnings
-from typing import Any, Set, Union
+from socket import gethostname
+from typing import Any, Set, Tuple, Union
 
 import numpy as np
 import torch
 from loguru import logger
 from torch import Tensor
 from torch._six import string_classes
+from torch.autograd import Function
 from torch.types import Number
 
+from df.config import config
 from df.model import ModelParams
+
+
+def get_device():
+    s = config("DEVICE", default="", section="train")
+    if s == "":
+        if torch.cuda.is_available():
+            DEVICE = torch.device("cuda:0")
+        else:
+            DEVICE = torch.device("cpu")
+    else:
+        DEVICE = torch.device(s)
+    return DEVICE
 
 
 def as_complex(x: Tensor):
@@ -30,6 +44,36 @@ def as_real(x: Tensor):
     if torch.is_complex(x):
         return torch.view_as_real(x)
     return x
+
+
+class angle_re_im(Function):
+    """Similar to torch.angle but robustify the gradient for zero magnitude."""
+
+    @staticmethod
+    def forward(ctx, re: Tensor, im: Tensor):
+        ctx.save_for_backward(re, im)
+        return torch.atan2(im, re)
+
+    @staticmethod
+    def backward(ctx, grad: Tensor) -> Tuple[Tensor, Tensor]:
+        re, im = ctx.saved_tensors
+        grad_inv = grad / (re.square() + im.square()).clamp_min_(1e-10)
+        return -im * grad_inv, re * grad_inv
+
+
+class angle(Function):
+    """Similar to torch.angle but robustify the gradient for zero magnitude."""
+
+    @staticmethod
+    def forward(ctx, x: Tensor):
+        ctx.save_for_backward(x)
+        return torch.atan2(x.imag, x.real)
+
+    @staticmethod
+    def backward(ctx, grad: Tensor):
+        (x,) = ctx.saved_tensors
+        grad_inv = grad / (x.real.square() + x.imag.square()).clamp_min_(1e-10)
+        return torch.view_as_complex(torch.stack((-x.imag * grad_inv, x.real * grad_inv), dim=-1))
 
 
 def check_finite_module(obj, name="Module", _raise=True) -> Set[str]:
@@ -94,25 +138,30 @@ def check_manual_seed(seed: int = None):
 
 
 def get_git_root():
-    git_local_dir = os.path.dirname(os.path.abspath(__file__))
-    args = ["git", "-C", git_local_dir, "rev-parse", "--show-toplevel"]
-    return subprocess.check_output(args).strip().decode()
+    """Returns the top level git directory or None if not called within the git repository."""
+    try:
+        git_local_dir = os.path.dirname(os.path.abspath(__file__))
+        args = ["git", "-C", git_local_dir, "rev-parse", "--show-toplevel"]
+        return subprocess.check_output(args).strip().decode()
+    except subprocess.CalledProcessError:
+        return None
 
 
 def get_commit_hash():
     """Returns the current git commit."""
     try:
         git_dir = get_git_root()
+        if git_dir is None:
+            return None
         args = ["git", "-C", git_dir, "rev-parse", "--short", "--verify", "HEAD"]
-        commit = subprocess.check_output(args).strip().decode()
+        return subprocess.check_output(args).strip().decode()
     except subprocess.CalledProcessError:
         # probably not in git repo
-        commit = None
-    return commit
+        return None
 
 
 def get_host() -> str:
-    return os.uname().nodename
+    return gethostname()
 
 
 def get_branch_name():
@@ -124,70 +173,6 @@ def get_branch_name():
         # probably not in git repo
         branch = None
     return branch
-
-
-def clip_grad_norm_(
-    parameters,
-    max_norm: float,
-    norm_type: float = 2.0,
-    error_if_nonfinite: bool = False,
-) -> torch.Tensor:
-    r"""Pytorch 1.9 backport: Clips gradient norm of an iterable of parameters.
-
-    The norm is computed over all gradients together, as if they were
-    concatenated into a single vector. Gradients are modified in-place.
-
-    Args:
-        parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
-            single Tensor that will have gradients normalized
-        max_norm (float or int): max norm of the gradients
-        norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
-            infinity norm.
-        error_if_nonfinite (bool): if True, an error is thrown if the total
-            norm of the gradients from :attr:``parameters`` is ``nan``,
-            ``inf``, or ``-inf``. Default: False (will switch to True in the future)
-
-    Returns:
-        Total norm of the parameters (viewed as a single vector).
-    """
-    if isinstance(parameters, torch.Tensor):
-        parameters = [parameters]
-    parameters = [p for p in parameters if p.grad is not None]
-    max_norm = float(max_norm)
-    norm_type = float(norm_type)
-    if len(parameters) == 0:
-        return torch.tensor(0.0)
-    device = parameters[0].grad.device
-    if norm_type == torch._six.inf:
-        norms = [p.grad.detach().abs().max().to(device) for p in parameters]
-        total_norm = norms[0] if len(norms) == 1 else torch.max(torch.stack(norms))
-    else:
-        total_norm = torch.norm(
-            torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]),
-            norm_type,
-        )
-    if total_norm.isnan() or total_norm.isinf():
-        if error_if_nonfinite:
-            raise RuntimeError(
-                f"The total norm of order {norm_type} for gradients from "
-                "`parameters` is non-finite, so it cannot be clipped. To disable "
-                "this error and scale the gradients by the non-finite norm anyway, "
-                "set `error_if_nonfinite=False`"
-            )
-        else:
-            warnings.warn(
-                "Non-finite norm encountered in torch.nn.utils.clip_grad_norm_; continuing anyway. "
-                "Note that the default behavior will change in a future release to error out "
-                "if a non-finite total norm is encountered. At that point, setting "
-                "error_if_nonfinite=false will be required to retain the old behavior.",
-                FutureWarning,
-                stacklevel=2,
-            )
-    clip_coef = max_norm / (total_norm + 1e-6)
-    if clip_coef < 1:
-        for p in parameters:
-            p.grad.detach().mul_(clip_coef.to(p.grad.device))
-    return total_norm
 
 
 # from pytorch/ignite:
@@ -217,3 +202,45 @@ def detach_hidden(hidden: Any) -> Any:
     vector.
     """
     return apply_to_tensor(hidden, Tensor.detach)
+
+
+def download_file(url: str, download_dir: str, extract: bool = False):
+    import shutil
+    import zipfile
+
+    import requests
+
+    local_filename = url.split("/")[-1]
+    local_filename = os.path.join(download_dir, local_filename)
+    with requests.get(url, stream=True) as r:
+        if r.status_code >= 400:
+            logger.error(f"Error downloading file ({r.status_code}): {r.reason}")
+            exit(1)
+        with open(local_filename, "wb") as f:
+            shutil.copyfileobj(r.raw, f)
+    if extract:
+        if os.path.splitext(local_filename)[1] != ".zip":
+            logger.error("File not supported. Cannot extract.")
+            exit(1)
+
+        with zipfile.ZipFile(local_filename) as zf:
+            zf.extractall(download_dir)
+        os.remove(local_filename)
+
+    return local_filename
+
+
+def get_cache_dir():
+    try:
+        from appdirs import user_cache_dir
+
+        return user_cache_dir("DeepFilterNet")
+    except ImportError:
+        import sys
+
+        if sys.platform == "linux":
+            return os.path.expanduser("~/.cache/DeepFilterNet/")
+        else:
+            raise ValueError(
+                "Could not get cache dir. Please install `appdirs` via `pip install appdirs`"
+            )

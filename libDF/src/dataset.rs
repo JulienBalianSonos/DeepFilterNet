@@ -1,46 +1,47 @@
-use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::fs;
-use std::io::{BufReader, Cursor};
+use std::hash::{Hash, Hasher};
+use std::io::{BufReader, BufWriter};
+#[cfg(any(feature = "cache", feature = "vorbis"))]
+use std::io::{Cursor, Read, Seek};
 use std::ops::Range;
 use std::path::Path;
-use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::sync::mpsc::sync_channel;
+#[cfg(feature = "dataset_timings")]
+use std::time::Instant;
+use std::time::SystemTime;
 
+#[cfg(feature = "flac")]
+use claxon;
 use hdf5::{types::VarLenUnicode, File};
-use lewton::inside_ogg::OggStreamReader;
-use ndarray::prelude::*;
-use ndarray::Slice;
-use ogg::reading::PacketReader as OggPacketReader;
-use rand::prelude::{IteratorRandom, SliceRandom};
-use rand::Rng;
+use ndarray::{prelude::*, Slice};
+use ndarray_rand::rand::prelude::{IteratorRandom, SliceRandom};
 use rayon::prelude::*;
 use realfft::num_traits::Zero;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+#[cfg(feature = "vorbis")]
+use {lewton::inside_ogg::OggStreamReader, ogg::reading::PacketReader as OggPacketReader};
 
-use crate::{augmentations::*, mix_utils::*, transforms::*, util::*, Complex32, DFState};
+#[cfg(feature = "cache")]
+use crate::cache::ValidCache;
+use crate::{augmentations::*, transforms::*, util::*, Complex32, DFState};
 
 pub type Result<T> = std::result::Result<T, DfDatasetError>;
 
 #[derive(Error, Debug)]
 pub enum DfDatasetError {
-    #[error("Dataloading Timeout")]
-    TimeoutError,
     #[error("No Hdf5 datasets found")]
     NoDatasetFoundError,
     #[error("No Hdf5 dataset type found")]
     Hdf5DsTypeNotFoundError,
-    #[error("{codec:?} codec not supported for file {file:?}")]
-    CodecNotSupportedError { codec: Codec, file: String },
-    #[error("Channels not initialized. Have you already called start_epoch()?")]
-    ChannelsNotInitializedError,
+    #[error("{codec:?} codec not supported in dataset {ds:?}")]
+    CodecNotSupportedError { codec: Codec, ds: String },
     #[error("Unsupported during PCM decode: {0}")]
     PcmUnspportedDimension(usize),
     #[error("Wav Reader Error")]
-    WarReadError(#[from] crate::wav_utils::WavUtilsError),
+    WavReadError(#[from] crate::wav_utils::WavUtilsError),
     #[error("Input Range ({range:?}) larger than dataset size ({size:?})")]
     PcmRangeToLarge {
         range: Range<usize>,
@@ -48,16 +49,19 @@ pub enum DfDatasetError {
     },
     #[error("Data Processing Error: {0:?}")]
     DataProcessingError(String),
-    #[error("Multithreading Send Error: {0:?}")]
-    SendError(String),
     #[error("DF Transforms Error")]
     TransformError(#[from] crate::transforms::TransformError),
     #[error("DF Augmentation Error")]
     AugmentationError(#[from] crate::augmentations::AugmentationError),
-    #[error("DF Mix Error")]
-    MixError(#[from] DfMixUtilsError),
+
+    #[cfg(feature = "cache")]
+    #[error("DF Cache Error")]
+    CacheError(#[from] crate::cache::DfCacheError),
     #[error("DF Utils Error")]
-    UtilsError(#[from] UtilsError),
+    UtilsError(#[from] crate::util::UtilsError),
+    #[error("Error Detail")]
+    ErrorDetail { source: Box<Self>, msg: String },
+
     #[error("Ndarray Shape Error")]
     NdarrayShapeError(#[from] ndarray::ShapeError),
     #[error("Hdf5 Error")]
@@ -68,25 +72,62 @@ pub enum DfDatasetError {
     IoError(#[from] std::io::Error),
     #[error("Json Decoding Error")]
     JsonDecode(#[from] serde_json::Error),
-    #[error("Threadpool Builder Error")]
-    ThreadPoolBuildError(#[from] rayon::ThreadPoolBuildError),
+    #[cfg(feature = "vorbis")]
     #[error("Vorbis Decode Error")]
     VorbisError(#[from] lewton::VorbisError),
+    #[cfg(feature = "vorbis")]
     #[error("Ogg Decode Error")]
     OggReadError(#[from] ogg::reading::OggReadError),
+    #[cfg(feature = "flac")]
+    #[error("Flac Decode Error")]
+    FlacError(#[from] claxon::Error),
+    #[error("Multithreading Send Error: {0:?}")]
+    SendError(String),
+    #[error("Multithreading Recv Error: {0:?}")]
+    RecvError(String),
     #[error("Thread Join Error: {0:?}")]
     ThreadJoinError(String),
+    #[error("Crossbeam Multithreading Send Error: {0:?}")]
+    CrossbeamSendError(String),
+}
+
+impl<T> From<crossbeam_channel::SendError<T>> for DfDatasetError {
+    fn from(error: crossbeam_channel::SendError<T>) -> Self {
+        DfDatasetError::CrossbeamSendError(error.to_string())
+    }
+}
+
+impl From<std::sync::mpsc::RecvError> for DfDatasetError {
+    fn from(error: std::sync::mpsc::RecvError) -> Self {
+        DfDatasetError::RecvError(error.to_string())
+    }
+}
+
+impl<T> From<std::sync::mpsc::SendError<T>> for DfDatasetError {
+    fn from(error: std::sync::mpsc::SendError<T>) -> Self {
+        DfDatasetError::SendError(error.to_string())
+    }
 }
 
 fn one() -> f32 {
     1.
 }
+#[derive(Hash, Debug, Clone)]
+pub struct DatasetModified(SystemTime, u64); // Modified time and file size
+impl DatasetModified {
+    fn new(file_name: &str) -> Result<Self> {
+        let meta_data = fs::metadata(file_name)?;
+        Ok(DatasetModified(meta_data.modified()?, meta_data.len()))
+    }
+}
 #[derive(Deserialize, Debug, Clone)]
 pub struct Hdf5Cfg(
-    pub String,                                              // file name
-    #[serde(default = "one")] pub f32,                       // dataset sampling factor
-    #[serde(default = "Option::default")] pub Option<usize>, // fallback sampling rate
-    #[serde(default = "Option::default")] pub Option<usize>, // fallback max freq
+    pub String,                                                 // file name
+    #[serde(default = "one")] pub f32,                          // dataset sampling factor
+    #[serde(default = "Option::default")] pub Option<usize>,    // fallback sampling rate
+    #[serde(default = "Option::default")] pub Option<usize>,    // fallback max freq
+    #[serde(default = "Option::default")] pub Option<Hdf5Keys>, // cached key list
+    #[serde(default = "Option::default")] pub Option<u64>,      // modified hash
 );
 impl Hdf5Cfg {
     pub fn filename(&self) -> &str {
@@ -95,43 +136,155 @@ impl Hdf5Cfg {
     pub fn sampling_factor(&self) -> f32 {
         self.1
     }
+    pub fn set_sampling_factor(&mut self, f: f32) {
+        self.1 = f
+    }
     pub fn fallback_sr(&self) -> Option<usize> {
         self.2
     }
     pub fn fallback_max_freq(&self) -> Option<usize> {
         self.3
     }
+    pub fn keys_unchecked(&self) -> Option<&Hdf5Keys> {
+        self.4.as_ref()
+    }
+    pub fn hash(&self) -> Option<u64> {
+        self.5
+    }
+    pub fn store_modified_hash(&mut self, hash: u64) {
+        self.5 = Some(hash);
+    }
+    pub fn hash_from_ds_path(&self, ds_path: &str) -> Result<u64> {
+        Ok(calculate_hash(&DatasetModified::new(ds_path)?))
+    }
+    pub fn load_keys(&self, hash: u64) -> Result<Option<&Hdf5Keys>> {
+        if let Some(keys) = self.keys_unchecked() {
+            if keys.hash == hash {
+                return Ok(Some(keys));
+            }
+            println!("Hash does not match for {}", self.filename());
+            return Ok(None);
+        }
+        Ok(None)
+    }
+    pub fn set_keys_new(&mut self, hash: u64, keys: Vec<String>) -> Result<()> {
+        self.set_keys(Hdf5Keys {
+            filename: self.filename().to_string(),
+            hash,
+            keys,
+        })
+    }
+    pub fn set_keys(&mut self, keys: Hdf5Keys) -> Result<()> {
+        self.4.replace(keys);
+        Ok(())
+    }
+}
+fn calculate_hash<T: Hash>(t: &T) -> u64 {
+    let mut s = DefaultHasher::new();
+    t.hash(&mut s);
+    s.finish()
+}
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct Hdf5Keys {
+    pub filename: String,
+    hash: u64,
+    keys: Vec<String>,
 }
 #[derive(Deserialize, Debug)]
-pub struct DatasetConfig {
+pub struct DatasetConfigJson {
     pub train: Vec<Hdf5Cfg>,
     pub valid: Vec<Hdf5Cfg>,
     pub test: Vec<Hdf5Cfg>,
 }
-impl DatasetConfig {
-    pub fn open(path: &str) -> Result<Self> {
-        let file = fs::File::open(path)?;
+impl DatasetConfigJson {
+    pub fn open(cfg_path: &str) -> Result<Self> {
+        let file = fs::File::open(cfg_path)?;
         let reader = BufReader::new(file);
         let cfg = serde_json::from_reader(reader)?;
         Ok(cfg)
     }
-}
-
-pub struct Datasets<T> {
-    train: Arc<dyn Dataset<T> + Sync + Send>,
-    valid: Arc<dyn Dataset<T> + Sync + Send>,
-    test: Arc<dyn Dataset<T> + Sync + Send>,
-}
-
-impl<T> Datasets<T> {
-    pub fn new(
-        train: Arc<dyn Dataset<T> + Sync + Send>,
-        valid: Arc<dyn Dataset<T> + Sync + Send>,
-        test: Arc<dyn Dataset<T> + Sync + Send>,
-    ) -> Self {
-        Datasets { train, valid, test }
+    pub fn set_keys<S: Into<Split>>(&mut self, split: S, keys: &[Hdf5Keys]) -> Result<()> {
+        let s = match split.into() {
+            Split::Train => &mut self.train,
+            Split::Valid => &mut self.valid,
+            Split::Test => &mut self.test,
+        };
+        for cfg in s.iter_mut() {
+            if let Some(key_cache) = keys.iter().find(|c| c.filename == cfg.filename()) {
+                cfg.set_keys(key_cache.clone())?;
+            } else {
+                log::warn!("Could not find cached keys for {}", cfg.filename());
+            }
+        }
+        Ok(())
     }
-    fn get<S: Into<Split>>(&self, split: S) -> &Arc<dyn Dataset<T> + Sync + Send> {
+    pub fn split_config(&self, split: Split) -> DatasetSplitConfig {
+        match split {
+            Split::Train => DatasetSplitConfig {
+                hdf5s: self.train.clone(),
+                split: Split::Train,
+            },
+            Split::Valid => DatasetSplitConfig {
+                hdf5s: self.valid.clone(),
+                split: Split::Valid,
+            },
+            Split::Test => DatasetSplitConfig {
+                hdf5s: self.test.clone(),
+                split: Split::Test,
+            },
+        }
+    }
+}
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct DatasetConfigCacheJson(Vec<Hdf5Keys>);
+impl DatasetConfigCacheJson {
+    pub fn new(keys: Vec<Hdf5Keys>) -> Self {
+        DatasetConfigCacheJson(keys)
+    }
+    pub fn keys(&self) -> &Vec<Hdf5Keys> {
+        &self.0
+    }
+    pub fn open(cache_path: &str) -> Result<Self> {
+        let file = fs::File::open(cache_path)?;
+        let reader = BufReader::new(file);
+        let cfg = serde_json::from_reader(reader)?;
+        Ok(cfg)
+    }
+    pub fn write(&self, cache_path: &str) -> Result<()> {
+        let file = fs::OpenOptions::new().create(true).write(true).open(cache_path)?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer(writer, &self)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DatasetSplitConfig {
+    pub hdf5s: Vec<Hdf5Cfg>,
+    split: Split,
+}
+
+impl DatasetSplitConfig {
+    pub fn extend(&mut self, other: DatasetSplitConfig) {
+        assert_eq!(self.split, other.split);
+        self.hdf5s.extend(other.hdf5s);
+    }
+    pub fn is_empty(&self) -> bool {
+        self.hdf5s.is_empty()
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &Hdf5Cfg> {
+        self.hdf5s.iter()
+    }
+}
+
+pub struct Datasets {
+    pub train: FftDataset,
+    pub valid: FftDataset,
+    pub test: FftDataset,
+}
+
+impl Datasets {
+    pub fn get<S: Into<Split>>(&self, split: S) -> &FftDataset {
         match split.into() {
             Split::Train => &self.train,
             Split::Valid => &self.valid,
@@ -147,6 +300,22 @@ pub enum Split {
     Test = 2,
 }
 
+impl Split {
+    pub fn iter() -> impl Iterator<Item = Split> {
+        [Split::Train, Split::Valid, Split::Test].iter().cloned()
+    }
+}
+
+impl fmt::Display for Split {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Train => write!(f, "train"),
+            Self::Valid => write!(f, "valid"),
+            Self::Test => write!(f, "test"),
+        }
+    }
+}
+
 impl From<&str> for Split {
     fn from(split: &str) -> Self {
         match split {
@@ -158,402 +327,11 @@ impl From<&str> for Split {
     }
 }
 
-pub struct DataLoader<T>
-where
-    T: Data,
-{
-    datasets: Datasets<T>,
-    batch_size_train: usize,
-    batch_size_eval: usize,
-    num_prefech: usize,
-    idcs: Arc<Mutex<VecDeque<usize>>>,
-    current_split: Split,
-    fill_thread: Option<thread::JoinHandle<Result<()>>>,
-    out_receiver: Option<Receiver<Sample<T>>>,
-    overfit: bool,
-}
-
-#[derive(Default)]
-pub struct DataLoaderBuilder<T>
-where
-    T: Data,
-{
-    _ds: Option<Datasets<T>>,
-    _batch_size: Option<usize>,
-    _batch_size_eval: Option<usize>,
-    _prefetch: Option<usize>,
-    _num_threads: Option<usize>,
-    _overfit: Option<bool>,
-}
-
-impl<T> DataLoaderBuilder<T>
-where
-    T: Data,
-{
-    pub fn new(ds: Datasets<T>) -> Self {
-        DataLoaderBuilder::<T> {
-            _ds: Some(ds),
-            _batch_size: None,
-            _batch_size_eval: None,
-            _prefetch: None,
-            _num_threads: None,
-            _overfit: None,
-        }
-    }
-    pub fn batch_size(mut self, batch_size: usize) -> Self {
-        self._batch_size = Some(batch_size);
-        self
-    }
-    pub fn batch_size_eval(mut self, batch_size: usize) -> Self {
-        self._batch_size_eval = Some(batch_size);
-        self
-    }
-    pub fn prefetch(mut self, prefetch: usize) -> Self {
-        self._prefetch = Some(prefetch);
-        self
-    }
-    pub fn num_threads(mut self, num_threads: usize) -> Self {
-        self._num_threads = Some(num_threads);
-        self
-    }
-    pub fn overfit(mut self, overfit: bool) -> Self {
-        self._overfit = Some(overfit);
-        self
-    }
-    pub fn build(self) -> Result<DataLoader<T>> {
-        let bs = self._batch_size.unwrap_or(1);
-        let prefetch = self._prefetch.unwrap_or(bs * self._num_threads.unwrap_or(4) * 2);
-        let mut loader = DataLoader::new(
-            self._ds.unwrap(),
-            bs,
-            self._batch_size_eval,
-            prefetch,
-            self._num_threads,
-        )?;
-        loader.overfit = self._overfit.unwrap_or(false);
-        Ok(loader)
-    }
-}
-
-impl<T> DataLoader<T>
-where
-    T: Data,
-{
-    pub fn builder(ds: Datasets<T>) -> DataLoaderBuilder<T> {
-        DataLoaderBuilder::new(ds)
-    }
-    pub fn new(
-        datasets: Datasets<T>,
-        batch_size_train: usize,
-        batch_size_eval: Option<usize>,
-        num_prefech: usize,
-        num_threads: Option<usize>,
-    ) -> Result<Self> {
-        // Register global rayon threadpool. It will only be used for data loader workers.
-        let mut poolbuilder = rayon::ThreadPoolBuilder::new();
-        if let Some(num_threads) = num_threads {
-            poolbuilder = poolbuilder.num_threads(num_threads)
-        }
-        match poolbuilder
-            .thread_name(|idx| format!("DataLoader Worker {}", idx))
-            .build_global()
-        {
-            Ok(()) => (),
-            Err(e) => {
-                if e.to_string() != "The global thread pool has already been initialized." {
-                    return Err(e.into());
-                }
-                // else: already initialized, do not complain.
-            }
-        };
-        let batch_size_eval = batch_size_eval.unwrap_or(batch_size_train);
-        Ok(DataLoader {
-            datasets,
-            batch_size_train,
-            batch_size_eval,
-            num_prefech,
-            idcs: Arc::new(Mutex::new(VecDeque::new())),
-            current_split: Split::Train,
-            fill_thread: None,
-            out_receiver: None,
-            overfit: false,
-        })
-    }
-
-    pub fn dataset_len<S: Into<Split>>(&self, split: S) -> usize {
-        self.datasets.get(split).len()
-    }
-
-    pub fn len_of<S: Into<Split>>(&self, split: S) -> usize {
-        let split = split.into();
-        let bs = self.batch_size(&split);
-        self.dataset_len(split) / bs
-    }
-
-    pub fn cur_len(&self) -> usize {
-        self.dataset_len(self.current_split) / self.batch_size_train
-    }
-
-    pub fn batch_size(&self, split: &Split) -> usize {
-        if split == &Split::Train {
-            self.batch_size_train
-        } else {
-            self.batch_size_eval
-        }
-    }
-
-    pub fn start_idx_worker(
-        &mut self,
-        split: Split,
-        seed: u64,
-    ) -> Result<thread::JoinHandle<Result<()>>> {
-        let bs = self.batch_size(&split);
-        if self.num_prefech < bs {
-            eprintln!(
-                "Warning: Prefetch size ({}) is smaller then batch size ({}).",
-                self.num_prefech, bs
-            )
-        }
-        let (out_sender, out_receiver) = sync_channel(self.num_prefech);
-        self.out_receiver = Some(out_receiver);
-        let ds = Arc::clone(self.datasets.get(split));
-        let idcs = self.idcs.clone();
-        let handle = thread::spawn(move || -> Result<()> {
-            idcs.lock().unwrap().par_drain(..).try_for_each_init(
-                || {
-                    seed_from_u64(seed);
-                },
-                // TODO: This closure get's submitted to the thread pool in order. However,
-                // get_sample may take different amounts of time resulting in a different return
-                // order. This should be the last major thing that reduces reproducability a little.
-                // To make sure, we get the samples in the correct order, we could add another
-                // ordering index and some kind of cache to use in get_batch().
-                |(), idx| -> Result<()> {
-                    let sample = ds.get_sample(idx)?;
-                    if let Err(e) = out_sender.send(sample) {
-                        return Err(DfDatasetError::SendError(e.to_string()));
-                    }
-                    Ok(())
-                },
-            )?;
-            Ok(())
-        });
-        Ok(handle)
-    }
-
-    pub fn start_epoch<S: Into<Split>>(&mut self, split: S, seed: usize) -> Result<()> {
-        let split: Split = split.into();
-        // Drop fill thread if exits
-        if self.fill_thread.is_some() {
-            self.join_fill_thread()?;
-        }
-        // Prepare for new epoch
-        self.current_split = split;
-        seed_from_u64(seed as u64);
-        {
-            // Recreate indices to index into the dataset and shuffle them
-            let mut idcs = self.idcs.lock().unwrap();
-            if self.overfit {
-                println!("Overfitting on one batch.");
-                let bs = self.batch_size(&split);
-                idcs.clone_from(&(0..bs).cycle().take(self.dataset_len(split)).collect());
-            } else {
-                idcs.clone_from(&(0..self.dataset_len(split)).collect());
-                idcs.make_contiguous().shuffle(&mut thread_rng()?);
-            }
-        }
-        // Start thread to submit dataset jobs for the pool workers
-        self.fill_thread = Some(self.start_idx_worker(split, seed as u64)?);
-        Ok(())
-    }
-
-    pub fn get_batch<C>(&mut self) -> Result<Option<DsBatch<T>>>
-    where
-        C: Collate<T>,
-    {
-        let bs = self.batch_size(&self.current_split);
-        let mut samples = Vec::with_capacity(bs);
-        let mut i = 0;
-        let mut tries = 0;
-        let reciever = match self.out_receiver.as_ref() {
-            None => {
-                return Err(DfDatasetError::ChannelsNotInitializedError);
-            }
-            Some(r) => r,
-        };
-        'outer: while i < bs {
-            match reciever.recv_timeout(Duration::from_millis(100)) {
-                Err(_e) => {
-                    let isempty = if let Ok(idcs) = self.idcs.try_lock() {
-                        idcs.is_empty()
-                    } else {
-                        false
-                    };
-                    if isempty {
-                        self.join_fill_thread()?;
-                        return Ok(None);
-                    }
-                    if tries > 1000 {
-                        return Err(DfDatasetError::TimeoutError);
-                    }
-                    tries += 1;
-                    continue 'outer;
-                }
-                Ok(s) => samples.push(s),
-            }
-            i += 1;
-            tries = 0;
-        }
-
-        if samples.is_empty() {
-            println!("No more samples.");
-            return Ok(None);
-        }
-        let out = C::collate(
-            samples.as_mut_slice(),
-            self.datasets.get(self.current_split).max_sample_len(),
-        )?;
-        Ok(Some(out))
-    }
-
-    pub fn join_fill_thread(&mut self) -> Result<()> {
-        // Drop out_receiver so that parallel iter in fill thread will return
-        drop(self.out_receiver.take());
-        if let Some(thread) = self.fill_thread.take() {
-            if let Err(e) =
-                thread.join().map_err(|e| DfDatasetError::ThreadJoinError(format!("{:?}", e)))?
-            {
-                match e {
-                    DfDatasetError::SendError(_) => (),
-                    // Not expected send error due to out_channel closing
-                    e => {
-                        eprint!("Error during worker shutdown: {:?}", e);
-                        return Err(e);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-pub trait Collate<T: Data> {
-    fn collate(samples: &mut [Sample<T>], len: usize) -> Result<DsBatch<T>>;
-}
-impl Collate<f32> for f32 {
-    fn collate(samples: &mut [Sample<f32>], len: usize) -> Result<DsBatch<f32>> {
-        let lengths = samples.iter().map(|s| s.speech.len_of(Axis(1))).collect();
-        let speech = unpack_pad(|s: &mut Sample<f32>| &mut s.speech, samples, len)?;
-        let noise = unpack_pad(|s: &mut Sample<f32>| &mut s.noise, samples, len)?;
-        let noisy = unpack_pad(|s: &mut Sample<f32>| &mut s.noisy, samples, len)?;
-        let max_freq = samples.iter().map(|s| s.max_freq).collect();
-        let snr = samples.iter().map(|s| s.snr).collect();
-        let gain = samples.iter().map(|s| s.gain).collect();
-        let atten = samples.iter().map(|s| s.attenuation.unwrap_or(0)).collect();
-        Ok(DsBatch {
-            speech,
-            noise,
-            noisy,
-            feat_erb: None,
-            feat_spec: None,
-            lengths,
-            max_freq,
-            snr,
-            gain,
-            atten,
-        })
-    }
-}
-impl Collate<Complex32> for Complex32 {
-    fn collate(samples: &mut [Sample<Complex32>], len: usize) -> Result<DsBatch<Complex32>> {
-        let lengths = samples.iter().map(|s| s.speech.len_of(Axis(1))).collect();
-        let speech = unpack_pad(|s: &mut Sample<Complex32>| &mut s.speech, samples, len)?;
-        let noise = unpack_pad(|s: &mut Sample<Complex32>| &mut s.noise, samples, len)?;
-        let noisy = unpack_pad(|s: &mut Sample<Complex32>| &mut s.noisy, samples, len)?;
-        let feat_erb = if samples.first().unwrap().feat_erb.is_some() {
-            Some(unpack_pad(
-                |s: &mut Sample<Complex32>| s.feat_erb.as_mut().unwrap(),
-                samples,
-                len,
-            )?)
-        } else {
-            None
-        };
-        let feat_spec = if samples.first().unwrap().feat_spec.is_some() {
-            Some(unpack_pad(
-                |s: &mut Sample<Complex32>| s.feat_spec.as_mut().unwrap(),
-                samples,
-                len,
-            )?)
-        } else {
-            None
-        };
-        let max_freq = samples.iter().map(|s| s.max_freq).collect();
-        let snr = samples.iter().map(|s| s.snr).collect();
-        let gain = samples.iter().map(|s| s.gain).collect();
-        let atten = samples.iter().map(|s| s.attenuation.unwrap_or(0)).collect();
-        Ok(DsBatch {
-            speech,
-            noise,
-            noisy,
-            feat_erb,
-            feat_spec,
-            lengths,
-            max_freq,
-            snr,
-            gain,
-            atten,
-        })
-    }
-}
-
-impl<T> Drop for DataLoader<T>
-where
-    T: Data,
-{
-    fn drop(&mut self) {
-        self.join_fill_thread().unwrap(); // Stop out_receiver and join fill thread
-    }
-}
-
-pub struct DsBatch<T>
-where
-    T: Data,
-{
-    pub speech: ArrayD<T>,
-    pub noise: ArrayD<T>,
-    pub noisy: ArrayD<T>,
-    pub feat_erb: Option<ArrayD<f32>>,
-    pub feat_spec: Option<ArrayD<Complex32>>,
-    pub lengths: Array1<usize>,
-    pub max_freq: Array1<usize>,
-    pub snr: Vec<i8>,
-    pub gain: Vec<i8>,
-    pub atten: Vec<u8>, // attenuation limit in dB; 0 stands for no limit
-}
-impl<T> fmt::Debug for DsBatch<T>
-where
-    T: Data,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_fmt(format_args!(
-            "Dataset Batch with batch_size: '{}, len: '{}', snrs: '{:?}', gain: '{:?}')",
-            self.speech.len_of(Axis(0)),
-            self.speech.len_of(Axis(2)),
-            self.snr,
-            self.gain
-        ))
-    }
-}
-
 pub trait Data: Sized + Clone + Default + Send + Sync + Zero + 'static {}
 impl Data for f32 {}
 impl Data for Complex32 {}
 
-pub enum SampleType {
-    TimeDomain,
-    FreqDomain,
-}
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Sample<T>
 where
     T: Data,
@@ -566,13 +344,9 @@ where
     pub max_freq: usize,
     pub snr: i8,
     pub gain: i8,
-    pub attenuation: Option<u8>,
     pub idx: usize,
 }
 impl Sample<f32> {
-    fn sample_type(&self) -> SampleType {
-        SampleType::TimeDomain
-    }
     fn get_speech_view(&self) -> Result<ArrayView2<f32>> {
         Ok(self.speech.view().into_dimensionality()?)
     }
@@ -587,9 +361,6 @@ impl Sample<f32> {
     }
 }
 impl Sample<Complex32> {
-    fn sample_type(&self) -> SampleType {
-        SampleType::FreqDomain
-    }
     fn get_speech_view(&self) -> Result<ArrayView3<Complex32>> {
         Ok(self.speech.view().into_dimensionality()?)
     }
@@ -623,7 +394,7 @@ pub trait Dataset<T>
 where
     T: Data,
 {
-    fn get_sample(&self, idx: usize) -> Result<Sample<T>>;
+    fn get_sample(&self, idx: usize, seed: Option<u64>) -> Result<Sample<T>>;
     fn sr(&self) -> usize;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
@@ -631,46 +402,58 @@ where
     }
     fn max_sample_len(&self) -> usize;
     fn set_seed(&mut self, seed: u64);
+    fn need_generate_keys(&self) -> bool;
+    fn generate_keys(&mut self) -> Result<()>;
 }
 
 #[derive(Clone)]
-pub struct DatasetBuilder<'a> {
-    ds_dir: &'a str,
+pub struct DatasetBuilder {
+    ds_dir: String,
     sr: usize,
     fft_size: Option<usize>,
-    datasets: Vec<Hdf5Cfg>,
+    datasets: Option<DatasetSplitConfig>,
     max_len_s: Option<f32>,
     hop_size: Option<usize>,
     nb_erb: Option<usize>,
     nb_spec: Option<usize>,
     norm_alpha: Option<f32>,
-    p_atten_lim: Option<f32>,
     p_reverb: Option<f32>,
     p_fill_speech: Option<f32>,
     seed: Option<u64>,
     min_nb_freqs: Option<usize>,
+    global_sampling_f: Option<f32>,
+    snrs: Option<Vec<i8>>,
+    gains: Option<Vec<i8>>,
+    cache_valid: bool,
+    cache_valid_max_gb: Option<f32>,
+    num_threads: Option<usize>,
 }
-impl<'a> DatasetBuilder<'a> {
-    pub fn new(ds_dir: &'a str, sr: usize) -> Self {
+impl DatasetBuilder {
+    pub fn new(ds_dir: &str, sr: usize) -> Self {
         DatasetBuilder {
-            ds_dir,
+            ds_dir: ds_dir.to_string(),
             sr,
-            datasets: Vec::new(),
+            datasets: None,
             max_len_s: None,
             fft_size: None,
             hop_size: None,
             nb_erb: None,
             nb_spec: None,
             norm_alpha: None,
-            p_atten_lim: None,
             p_reverb: None,
             p_fill_speech: None,
             seed: None,
             min_nb_freqs: None,
+            global_sampling_f: None,
+            snrs: None,
+            gains: None,
+            cache_valid: false,
+            cache_valid_max_gb: None,
+            num_threads: None,
         }
     }
     pub fn build_fft_dataset(self) -> Result<FftDataset> {
-        if self.datasets.is_empty() {
+        if self.datasets.is_none() {
             panic!("No datasets provided")
         }
         let ds = self.clone().build_td_dataset()?;
@@ -687,6 +470,34 @@ impl<'a> DatasetBuilder<'a> {
                 return Err(DfDatasetError::DataProcessingError(msg));
             }
         }
+        let split = self.datasets.unwrap().split;
+        #[cfg(feature = "cache")]
+        let cache = {
+            if self.cache_valid && split == Split::Valid {
+                let ds_path = Path::new(&self.ds_dir);
+                let hash = {
+                    let mut hash_vec: Vec<u64> =
+                        ds.config.iter().map(|c| c.hash().unwrap()).collect();
+                    hash_vec.push(fft_size as u64);
+                    hash_vec.push(hop_size as u64);
+                    hash_vec.push(nb_erb as u64);
+                    calculate_hash(&hash_vec)
+                };
+                let cache_path = ds_path.join(format!("{}_cache_{}", split, hash));
+                Some(ValidCache::new(
+                    &cache_path,
+                    hash,
+                    ds.len(),
+                    self.cache_valid_max_gb,
+                )?)
+            } else {
+                None
+            }
+        };
+        #[cfg(not(feature = "cache"))]
+        if self.cache_valid && split == Split::Valid {
+            panic!("Dataset not compiled with caching capabilities");
+        }
         Ok(FftDataset {
             ds,
             fft_size,
@@ -695,86 +506,143 @@ impl<'a> DatasetBuilder<'a> {
             nb_spec: self.nb_spec,
             norm_alpha: self.norm_alpha,
             min_nb_freqs: self.min_nb_freqs,
+            #[cfg(feature = "cache")]
+            cache,
         })
     }
-    pub fn build_td_dataset(mut self) -> Result<TdDataset> {
-        if self.datasets.is_empty() {
-            panic!("No datasets provided")
-        }
+    pub fn build_td_dataset(self) -> Result<TdDataset> {
+        let datasets = match self.datasets {
+            None => panic!("No datasets provided"),
+            Some(ds) => ds,
+        };
+        // TODO: Return all sample by default and not only 10 seconds
         let max_samples: usize = (self.max_len_s.unwrap_or(10.) * self.sr as f32).round() as usize;
-        let mut hdf5_handles = Vec::new();
-        let mut sp_keys: Vec<(usize, String)> = Vec::new();
-        let mut ns_keys: Vec<(usize, String)> = Vec::new();
-        let mut rir_keys: Vec<(usize, String)> = Vec::new();
-        let mut config: Vec<Hdf5Cfg> = Vec::new();
-        let mut i = 0;
-        for cfg in self.datasets.drain(..) {
-            let name = cfg.filename();
-            let path = Path::new(self.ds_dir).join(name);
-            if (!path.is_file())
-                || match path.read_link() {
-                    Err(_) => false,
-                    Ok(p) => p.is_file(),
-                }
-            {
-                eprintln!("Dataset {} not found. Skipping.", name);
-                continue;
+        // Get dataset handles and keys. Each key is a unique String.
+        let ds_path = Path::new(&self.ds_dir);
+        let (sender, receiver) = sync_channel(datasets.hdf5s.len() + 1);
+        if let Some(n) = self.num_threads {
+            hdf5::sync::sync(|| {});
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .thread_name(|idx| format!("DataLoader Worker {}", idx))
+                .start_handler(|_| hdf5::sync::sync(|| {}))
+                .build_global()
+                .unwrap_or(());
+        }
+        datasets.hdf5s.par_iter().try_for_each(|cfg| -> Result<()> {
+            let path = ds_path.join(cfg.filename());
+            if (!path.is_file()) && path.read_link().is_err() {
+                log::warn!("Dataset {:?} not found. Skipping.", path);
+                return Ok(());
             }
+            let mut cfg = cfg.clone();
             let ds = Hdf5Dataset::new(path.to_str().unwrap())?;
-            let n_samples = (cfg.sampling_factor() * ds.len() as f32).round() as usize;
-            let keys: Vec<(usize, String)> =
-                ds.keys()?.iter().cycle().take(n_samples).map(|k| (i, k.clone())).collect();
-            match ds.dstype {
-                DsType::Speech => sp_keys.extend(keys),
-                DsType::Noise => ns_keys.extend(keys),
-                DsType::RIR => rir_keys.extend(keys),
+            let modified_hash = cfg.hash_from_ds_path(path.to_str().unwrap())?;
+            cfg.store_modified_hash(modified_hash);
+            let keys = cfg.load_keys(modified_hash)?.cloned();
+            match keys {
+                Some(keys) => cfg.set_keys(keys)?,
+                None => cfg.set_keys_new(modified_hash, ds.keys()?)?,
+            };
+            if let Some(f) = self.global_sampling_f {
+                cfg.set_sampling_factor(cfg.sampling_factor() * f)
             }
-            hdf5_handles.push(ds);
+            sender.send(Some((cfg, ds))).unwrap();
+            Ok(())
+        })?;
+        sender.send(None).unwrap();
+        let mut config = Vec::new();
+        let mut hdf5_handles = Vec::new();
+        let mut ds_keys = Vec::new();
+        let mut has_rirs = false;
+        let mut i = 0;
+        let mut ds_len: usize = 0;
+        while let Some((cfg, ds)) = receiver.try_recv().unwrap() {
+            has_rirs = has_rirs || ds.dstype == DsType::RIR;
+            let keys = cfg.keys_unchecked().unwrap().keys.clone();
+            if ds.dstype == DsType::Speech {
+                ds_len += (keys.len() as f32 * cfg.sampling_factor()).round() as usize;
+            }
+            ds_keys.push((ds.dstype, i, keys));
             config.push(cfg);
+            log::debug!(
+                "Found {} {} dataset {} with {} samples",
+                &ds.dstype,
+                datasets.split,
+                ds.name(),
+                ds.len()
+            );
+            hdf5_handles.push(ds);
             i += 1;
         }
         if hdf5_handles.is_empty() {
             return Err(DfDatasetError::NoDatasetFoundError);
         }
-        let snrs = vec![-5, 0, 5, 10, 20, 40];
-        let gains = vec![-6, 0, 6];
-        let attenuation_range = (6, 40);
-        let p_atten_lim = self.p_atten_lim.unwrap_or(0.);
+        let snrs = self.snrs.unwrap_or_else(|| vec![-5, 0, 5, 10, 20, 40]);
+        let gains = self.gains.unwrap_or_else(|| vec![-6, 0, 6]);
         let p_fill_speech = self.p_fill_speech.unwrap_or(0.);
-        let sp_transforms = Compose::new(vec![
+        let ds_split = datasets.split;
+        let sp_augmentations = Compose::new(vec![
             Box::new(RandRemoveDc::default_with_prob(0.25)),
             Box::new(RandLFilt::default_with_prob(0.25)),
-            Box::new(RandEQ::default_with_prob(0.25).with_sr(self.sr)),
+            Box::new(RandBiquadFilter::default_with_prob(0.1).with_sr(self.sr)),
             Box::new(RandResample::default_with_prob(0.1).with_sr(self.sr)),
         ]);
-        let ns_transforms = sp_transforms.clone();
+        let mut sp_distortions = Compose::new(Vec::new());
+        if ds_split == Split::Train {
+            sp_distortions.push(Box::new(
+                RandClipping::default_with_prob(0.05).with_c(0.05..0.9),
+            ))
+        }
+        let mut ns_augmentations = Compose::new(vec![
+            Box::new(RandLFilt::default_with_prob(0.25)),
+            Box::new(RandBiquadFilter::default_with_prob(0.25).with_sr(self.sr)),
+            Box::new(RandResample::default_with_prob(0.05).with_sr(self.sr)),
+        ]);
+        if ds_split == Split::Train {
+            ns_augmentations.push(Box::new(
+                RandClipping::default_with_prob(0.1).with_c(0.01..0.5),
+            ))
+        }
         let p_reverb = self.p_reverb.unwrap_or(0.);
-        if p_reverb > 0. && rir_keys.is_empty() {
-            eprintln!("Warning: Reverb augmentation enabled but no RIRs provided!");
+        if p_reverb > 0. && !has_rirs {
+            log::warn!("Reverb augmentation enabled but no RIRs provided!",);
         }
         let reverb = RandReverbSim::new(p_reverb, self.sr);
         let seed = self.seed.unwrap_or(0);
+        // 5% of noises used for mixing will contain randomly generated noise.
+        // This has the advantage that the noise will actually contain frequencies up 24 kHz.
+        let noise_generator =
+            NoiseGenerator::new(self.sr, if ds_split == Split::Train { 0.05 } else { 0.0 });
         Ok(TdDataset {
             config,
             hdf5_handles,
             max_samples,
             sr: self.sr,
-            sp_keys,
-            ns_keys,
-            rir_keys,
+            ds_keys,
+            ds_split,
+            sp_keys: Vec::new(),
+            ns_keys: Vec::new(),
+            rir_keys: Vec::new(),
             snrs,
             gains,
-            attenuation_range,
             p_fill_speech,
-            p_atten_lim,
-            sp_transforms,
-            ns_transforms,
+            sp_augmentations,
+            sp_distortions,
+            ns_augmentations,
+            noise_generator,
             reverb,
             seed,
+            ds_len,
         })
     }
-    pub fn dataset(mut self, datasets: Vec<Hdf5Cfg>) -> Self {
-        self.datasets.extend(datasets);
+    pub fn dataset(mut self, datasets: DatasetSplitConfig) -> Self {
+        let has_ds = self.datasets.is_some();
+        if has_ds {
+            self.datasets.as_mut().unwrap().extend(datasets)
+        } else {
+            self.datasets = Some(datasets)
+        }
         self
     }
     pub fn max_len(mut self, max_len_s: f32) -> Self {
@@ -796,9 +664,8 @@ impl<'a> DatasetBuilder<'a> {
         self.norm_alpha = norm_alpha;
         self
     }
-    pub fn prob_atten_lim(mut self, p_atten_lim: f32) -> Self {
-        assert!((0. ..=1.).contains(&p_atten_lim));
-        self.p_atten_lim = Some(p_atten_lim);
+    pub fn global_sample_factor(mut self, f: f32) -> Self {
+        self.global_sampling_f = Some(f);
         self
     }
     pub fn prob_reverberation(mut self, p_reverb: f32) -> Self {
@@ -818,6 +685,24 @@ impl<'a> DatasetBuilder<'a> {
         self.min_nb_freqs = Some(n);
         self
     }
+    pub fn snrs(mut self, snrs: Vec<i8>) -> Self {
+        self.snrs = Some(snrs);
+        self
+    }
+    pub fn gains(mut self, gains: Vec<i8>) -> Self {
+        self.gains = Some(gains);
+        self
+    }
+    pub fn num_threads(mut self, n: usize) -> Self {
+        self.num_threads = Some(n);
+        self
+    }
+    /// Use a cache for validation set. If `max_gb` is None use `DF_CACHE_MAX_GB` env is used.
+    pub fn cache_valid_dataset(mut self, max_gb: Option<f32>) -> Self {
+        self.cache_valid = true;
+        self.cache_valid_max_gb = max_gb;
+        self
+    }
 }
 
 pub struct FftDataset {
@@ -828,10 +713,30 @@ pub struct FftDataset {
     nb_spec: Option<usize>,
     norm_alpha: Option<f32>,
     min_nb_freqs: Option<usize>,
+    #[cfg(feature = "cache")]
+    cache: Option<ValidCache>,
+}
+impl FftDataset {
+    pub fn get_hdf5cfg(&self, filename: &str) -> Option<&Hdf5Cfg> {
+        self.ds.config.iter().find(|&cfg| cfg.filename() == filename)
+    }
 }
 impl Dataset<Complex32> for FftDataset {
-    fn get_sample(&self, idx: usize) -> Result<Sample<Complex32>> {
-        let sample: Sample<f32> = self.ds.get_sample(idx)?;
+    fn get_sample(&self, idx: usize, seed: Option<u64>) -> Result<Sample<Complex32>> {
+        #[cfg(feature = "dataset_timings")]
+        let t0 = Instant::now();
+        #[cfg(feature = "cache")]
+        let hash = if let Some(cache) = self.cache.as_ref() {
+            let hash = calculate_hash(&(idx, seed));
+            if let Some(s) = cache.load_sample(hash)? {
+                log::trace!("Found cached sample for idx {} (hash: {})", idx, hash);
+                return Ok(s);
+            }
+            hash
+        } else {
+            0
+        };
+        let sample: Sample<f32> = self.ds.get_sample(idx, seed)?;
         let nb_erb = self.nb_erb.unwrap_or(1);
         let mut state = DFState::new(self.sr(), self.fft_size, self.hop_size, nb_erb, 1);
         let speech = stft(sample.get_speech_view()?, &mut state, false);
@@ -855,7 +760,7 @@ impl Dataset<Complex32> for FftDataset {
         } else {
             None
         };
-        Ok(Sample {
+        let sample = Sample {
             speech: speech.into_dyn(),
             noise: noise.into_dyn(),
             noisy: noisy.into_dyn(),
@@ -864,13 +769,23 @@ impl Dataset<Complex32> for FftDataset {
             max_freq: sample.max_freq,
             gain: sample.gain,
             snr: sample.snr,
-            attenuation: sample.attenuation,
             idx: sample.idx,
-        })
+        };
+        #[cfg(feature = "cache")]
+        if let Some(cache) = self.cache.as_ref() {
+            log::trace!("Caching sample for idx {} (hash: {})", idx, hash);
+            cache.cache_sample(hash, &sample)?;
+        }
+        #[cfg(feature = "dataset_timings")]
+        log::trace!(
+            "FD sample: {:?} ms",
+            (std::time::Instant::now() - t0).as_millis()
+        );
+        Ok(sample)
     }
 
     fn len(&self) -> usize {
-        self.ds.sp_keys.len()
+        self.ds.len()
     }
 
     fn sr(&self) -> usize {
@@ -884,25 +799,45 @@ impl Dataset<Complex32> for FftDataset {
     fn set_seed(&mut self, seed: u64) {
         self.ds.set_seed(seed)
     }
+
+    fn need_generate_keys(&self) -> bool {
+        #[cfg(feature = "cache")]
+        if let Some(cache) = self.cache.as_ref() {
+            match cache.flush() {
+                Ok(_) => (),
+                Err(e) => {
+                    log::warn!("Failed to flush cache: {:?}", e);
+                }
+            }
+        }
+        self.ds.need_generate_keys()
+    }
+
+    fn generate_keys(&mut self) -> Result<()> {
+        self.ds.generate_keys()
+    }
 }
 
 pub struct TdDataset {
-    config: Vec<Hdf5Cfg>,
-    hdf5_handles: Vec<Hdf5Dataset>,
-    max_samples: usize,
-    sr: usize,
-    sp_keys: Vec<(usize, String)>,
+    config: Vec<Hdf5Cfg>,                       // config
+    hdf5_handles: Vec<Hdf5Dataset>,             // Handles to access opened Hdf5 datasets
+    max_samples: usize,                         // Number of samples in time domain
+    sr: usize,                                  // Sampling rate
+    ds_keys: Vec<(DsType, usize, Vec<String>)>, // Dataset keys as a vector of [DS Type, hdf5 index, Vec<str keys>].
+    ds_split: Split,                            // Train/Valid/Test
+    sp_keys: Vec<(usize, String)>, // Pair of hdf5 index and dataset keys. Will be generated at each epoch start
     ns_keys: Vec<(usize, String)>,
     rir_keys: Vec<(usize, String)>,
-    snrs: Vec<i8>,               // in dB; SNR to sample from
-    gains: Vec<i8>,              // in dB; Speech (loudness) to sample from
-    attenuation_range: (u8, u8), // in dB; Return a target sample containing noise for attenuation limited algorithm
-    p_atten_lim: f32,            // Probability for containing noise in target
+    snrs: Vec<i8>,                   // in dB; SNR to sample from
+    gains: Vec<i8>,                  // in dB; Speech (loudness) to sample from
     p_fill_speech: f32, // Probability to completely fill the speech signal to `max_samples` with a different speech sample
-    sp_transforms: Compose, // Transforms to augment speech samples
-    ns_transforms: Compose, // Transforms to augment noise samples
+    noise_generator: NoiseGenerator, // Create random noises
+    sp_augmentations: Compose, // Transforms to augment speech samples
+    sp_distortions: Compose, // Transforms to distort speech samples for used generating the mixture
+    ns_augmentations: Compose, // Transforms to augment noise samples
     reverb: RandReverbSim, // Separate reverb transform that may be applied to both speech and noise
     seed: u64,
+    ds_len: usize,
 }
 
 impl TdDataset {
@@ -920,7 +855,7 @@ impl TdDataset {
             let max_len = sample_len.min(l_sr);
             let s = sample_len as i64 - max_len as i64;
             if s > 0 {
-                let s = thread_rng()?.gen_range(0..(s as usize));
+                let s = thread_rng()?.uniform(0, s as usize);
                 Some(s..s + l_sr)
             } else {
                 None
@@ -929,10 +864,20 @@ impl TdDataset {
             None
         };
         let mut x = if let Some(slc) = slc {
-            h.read_slc(key, slc)?
+            h.read_slc(key, slc)
         } else {
-            h.read(key)?
-        };
+            h.read(key)
+        }
+        .map_err(move |e: DfDatasetError| -> DfDatasetError {
+            DfDatasetError::ErrorDetail {
+                source: Box::new(e),
+                msg: format!(
+                    "Error reading sample '{}' from dataset {}",
+                    key,
+                    self.ds_name(idx)
+                ),
+            }
+        })?;
         if sr != self.sr {
             x = resample(&x, sr, self.sr, None)?;
             if let Some(l) = max_len {
@@ -950,17 +895,32 @@ impl TdDataset {
         Ok(x)
     }
 
+    fn read_all_channels(&self, idx: usize, key: &str) -> Result<Array2<f32>> {
+        let x = self._read_from_hdf5(key, idx, None)?;
+        Ok(x)
+    }
+
     fn read_max_len(&self, idx: usize, key: &str) -> Result<Array2<f32>> {
+        #[cfg(feature = "dataset_timings")]
+        let t0 = Instant::now();
         let x = match self._read_from_hdf5(key, idx, Some(self.max_samples)) {
             Err(e) => {
-                eprintln!("Error during speech reading get_data(): {:?}", e);
-                if e.to_string().contains("inflate") {
+                log::warn!(
+                    "Error during {} read_max_len() for key '{}' from dataset {}: {:?}",
+                    self.ds_type(idx),
+                    key,
+                    self.ds_name(idx),
+                    e
+                );
+                let e_str = e.to_string();
+                if e_str.contains("inflate") || e_str.contains("Flac") {
                     // Get a different speech then
-                    let idx = thread_rng()?.gen_range(0..self.len());
+                    let idx = thread_rng()?.uniform(0, self.len());
                     let (sp_idx, sp_key) = &self.sp_keys[idx];
-                    eprintln!(
-                        "Returning a different speech sample from {}",
-                        self.ds_name(*sp_idx)
+                    log::warn!(
+                        "Returning a different speech sample from {} due to {}",
+                        self.ds_name(*sp_idx),
+                        e_str
                     );
                     self.read_max_len(*sp_idx, sp_key)?
                 } else {
@@ -969,6 +929,15 @@ impl TdDataset {
             }
             Ok(s) => s,
         };
+        #[cfg(feature = "dataset_timings")]
+        {
+            log::trace!(
+                "Loaded sample {} with codec {:?} in {} ms",
+                key,
+                self.ds_codec(idx),
+                (Instant::now() - t0).as_millis()
+            );
+        }
         debug_assert!(x.len_of(Axis(1)) <= self.max_samples);
         Ok(x)
     }
@@ -987,30 +956,51 @@ impl TdDataset {
     fn ds_name(&self, idx: usize) -> String {
         self.hdf5_handles[idx].name()
     }
+
+    fn ds_type(&self, idx: usize) -> String {
+        self.hdf5_handles[idx].ds_type()
+    }
+
+    fn ds_codec(&self, idx: usize) -> Codec {
+        self.hdf5_handles[idx].codec.clone().unwrap_or_default()
+    }
 }
 
 impl Dataset<f32> for TdDataset {
-    fn get_sample(&self, idx: usize) -> Result<Sample<f32>> {
-        seed_from_u64(idx as u64 + self.seed);
+    fn get_sample(&self, idx: usize, seed: Option<u64>) -> Result<Sample<f32>> {
+        #[cfg(feature = "dataset_timings")]
+        let t0 = Instant::now();
+        seed_from_u64(self.seed + seed.unwrap_or(idx as u64));
         let mut rng = thread_rng()?;
         let (sp_idx, sp_key) = &self.sp_keys[idx];
         let mut speech = self.read_max_len(*sp_idx, sp_key)?;
-        self.sp_transforms.transform(&mut speech)?;
+        self.sp_augmentations.transform(&mut speech)?;
         let mut max_freq = self.max_freq(*sp_idx)?;
         while speech.len_of(Axis(1)) < self.max_sample_len()
             && self.p_fill_speech > 0.0
-            && self.p_fill_speech > rng.gen_range(0f32..1f32)
+            && self.p_fill_speech > rng.uniform(0f32, 1f32)
         {
             // If too short, maybe sample another speech sample
             let (sp_idx, sp_key) = &self.sp_keys.choose(&mut rng).unwrap();
             let mut another_speech = self.read_max_len(*sp_idx, sp_key)?;
-            self.sp_transforms.transform(&mut another_speech)?;
+            self.sp_augmentations.transform(&mut another_speech)?;
             speech.append(Axis(1), another_speech.view())?;
             max_freq = max_freq.min(self.max_freq(*sp_idx)?);
         }
         if speech.len_of(Axis(1)) > self.max_sample_len() {
             speech.slice_axis_inplace(Axis(1), Slice::from(..self.max_samples));
         }
+        #[cfg(feature = "dataset_timings")]
+        let t_sp = Instant::now();
+        // Apply low pass to the noise as well
+        let noise_low_pass = if max_freq < self.sr / 2 {
+            Some(LpParam {
+                cut_off: max_freq,
+                sr: self.sr,
+            })
+        } else {
+            None
+        };
         let mut ch = speech.len_of(Axis(0));
         let mut len = speech.len_of(Axis(1));
         if len > self.max_samples {
@@ -1022,63 +1012,86 @@ impl Dataset<f32> for TdDataset {
             ch = 1;
         }
         // Sample 2-5 noises and augment each
-        let n_noises = rng.gen_range(2..6);
+        let n_noises = rng.uniform(2, 6);
         let ns_ids = self.ns_keys.iter().choose_multiple(&mut rng, n_noises);
         let mut noises = Vec::with_capacity(n_noises);
         let mut noise_gains = Vec::with_capacity(n_noises);
         for (ns_idx, ns_key) in &ns_ids {
+            // In 5% us a randomly generated noise signal instead of a real noise.
+            if let Some(ns) =
+                self.noise_generator.generate_random_noise(-2., 2., 1, self.max_samples)?
+            {
+                noises.push(ns);
+                noise_gains.push([-24, -12, -6, 0].choose(&mut rng).unwrap());
+                continue;
+            }
             let mut ns = match self.read_max_len(*ns_idx, ns_key) {
                 Err(e) => {
-                    eprintln!("Error during noise reading get_data(): {}", e);
+                    log::warn!("Error during noise reading get_sample(): {}", e);
                     continue;
                 }
                 Ok(n) => n,
             };
-            if ns.len_of(Axis(1)) < 10 {
+            if ns.len_of(Axis(1)) < 100 {
                 continue;
             }
-            self.ns_transforms.transform(&mut ns)?;
+            self.ns_augmentations.transform(&mut ns)?;
             if ns.len_of(Axis(1)) > self.max_samples {
                 ns.slice_axis_inplace(Axis(1), Slice::from(..self.max_samples));
             }
             noises.push(ns);
             noise_gains.push(self.gains.choose(&mut rng).unwrap());
         }
+        #[cfg(feature = "dataset_timings")]
+        let t_ns = Instant::now();
         let noise_gains_f32: Vec<f32> = noise_gains.iter().map(|x| **x as f32).collect();
         // Sample SNR and gain
         let &snr = self.snrs.choose(&mut rng).unwrap();
         let &gain = self.gains.choose(&mut rng).unwrap();
-        // Sample attenuation limiting during training
-        let atten = if self.p_atten_lim > 0. && self.p_atten_lim > rng.gen_range(0f32..1f32) {
-            Some(rng.gen_range(self.attenuation_range.0..self.attenuation_range.1))
-        } else {
-            None
-        };
         // Truncate to speech len, combine noises and mix to noisy
         let mut noise = combine_noises(ch, len, &mut noises, Some(noise_gains_f32.as_slice()))?;
+        // Optionally we may also introduce some distortions to the speech signal.
+        // These distortions will be only present in the noisy mixture, with the aim to reconstruce
+        // the original undistorted signal. Example distortions are reverberation, or clipping.
+        // TODO: Think about codec distortions or filters like low-pass.
+        let mut speech_distorted = None;
         // Apply reverberation using a randomly sampled RIR
-        let speech_rev = if !self.rir_keys.is_empty() {
-            self.reverb.transform(&mut speech, &mut noise, || {
+        if !self.rir_keys.is_empty() {
+            speech_distorted = self.reverb.transform(&mut speech, &mut noise, || {
                 let (rir_idx, rir_key) = self.rir_keys.iter().choose(&mut rng).unwrap();
                 let rir = self.read(*rir_idx, rir_key)?;
                 Ok(rir)
             })?
-        } else {
-            None
-        };
+        }
         if max_freq < self.sr / 2 {
             // Apply low pass (via resampling) to the noise to match speech sampling rate
             noise = low_pass_resample(&noise, max_freq, self.sr)?;
             noise.slice_axis_inplace(Axis(1), Slice::from(..len));
         }
+        if !self.sp_distortions.is_empty() {
+            let mut d = speech_distorted.unwrap_or_else(|| speech.clone());
+            self.sp_distortions.transform(&mut d)?;
+            speech_distorted = Some(d);
+        }
         let (speech, noise, noisy) = mix_audio_signal(
             speech,
-            speech_rev,
+            speech_distorted,
             noise,
             snr as f32,
             gain as f32,
-            atten.map(|a| a as f32),
+            noise_low_pass,
         )?;
+        #[cfg(feature = "dataset_timings")]
+        if log::log_enabled!(log::Level::Trace) {
+            let te = std::time::Instant::now();
+            log::trace!(
+                "TD sample: {:?} ms (speech: {:?} ms, noise: {:?} ms, mix: {:?} ms)",
+                (te - t0).as_millis(),
+                (t_sp - t0).as_millis(),
+                (t_ns - t_sp).as_millis(),
+                (te - t_ns).as_millis(),
+            );
+        }
         Ok(Sample {
             speech: speech.into_dyn(),
             noise: noise.into_dyn(),
@@ -1088,13 +1101,12 @@ impl Dataset<f32> for TdDataset {
             max_freq,
             snr,
             gain,
-            attenuation: atten,
             idx,
         })
     }
 
     fn len(&self) -> usize {
-        self.sp_keys.len()
+        self.ds_len
     }
 
     fn sr(&self) -> usize {
@@ -1108,9 +1120,50 @@ impl Dataset<f32> for TdDataset {
     fn set_seed(&mut self, seed: u64) {
         self.seed = seed
     }
+
+    fn need_generate_keys(&self) -> bool {
+        if self.sp_keys.is_empty() {
+            return true;
+        }
+        if self.ds_split == Split::Train {
+            for (_, hdf5_idx, _) in self.ds_keys.iter() {
+                let f = self.config[*hdf5_idx].sampling_factor();
+                // if not a natural number, then we need to regenerate.
+                if f != f.round() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn generate_keys(&mut self) -> Result<()> {
+        self.sp_keys.clear();
+        self.ns_keys.clear();
+        self.rir_keys.clear();
+
+        for (dstype, hdf5_idx, keys) in self.ds_keys.iter() {
+            debug_assert_eq!(&self.hdf5_handles[*hdf5_idx].keys().unwrap(), keys);
+            let len = keys.len();
+            let n_samples =
+                (self.config[*hdf5_idx].sampling_factor() * len as f32).round() as usize;
+            let mut keys = keys.clone();
+            if self.ds_split == Split::Train {
+                keys.shuffle(&mut thread_rng()?);
+            }
+            let keys: Vec<(usize, String)> =
+                keys.iter().cycle().take(n_samples).map(|k| (*hdf5_idx, k.clone())).collect();
+            match dstype {
+                DsType::Speech => self.sp_keys.extend(keys),
+                DsType::Noise => self.ns_keys.extend(keys),
+                DsType::RIR => self.rir_keys.extend(keys),
+            }
+        }
+        Ok(())
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq, PartialOrd, Ord, Clone, Copy)]
 pub enum DsType {
     Speech = 0,
     Noise = 1,
@@ -1121,10 +1174,11 @@ impl fmt::Display for DsType {
         write!(f, "{:?}", self)
     }
 }
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Codec {
     PCM = 0,
     Vorbis = 1,
+    FLAC = 2,
 }
 impl Default for &Codec {
     fn default() -> Self {
@@ -1145,9 +1199,9 @@ pub enum DType {
 #[derive(Debug)]
 pub struct Hdf5Dataset {
     file: File,
-    dstype: DsType,
-    sr: Option<usize>,
-    codec: Option<Codec>,
+    pub dstype: DsType,
+    pub sr: Option<usize>,
+    pub codec: Option<Codec>,
     max_freq: Option<usize>,
     dtype: Option<DType>,
 }
@@ -1165,8 +1219,28 @@ fn get_dstype(file: &File) -> Option<DsType> {
 }
 
 impl Hdf5Dataset {
-    fn new(path: &str) -> Result<Self> {
-        let file = File::open(path)?;
+    pub fn new(path: &str) -> Result<Self> {
+        let file = Self::open_file(path, false)?;
+        Self::init_impl(file)
+    }
+    pub fn new_rw(path: &str) -> Result<Self> {
+        let file = Self::open_file(path, true)?;
+        Self::init_impl(file)
+    }
+    fn open_file(path: &str, rw: bool) -> Result<File> {
+        let file = if rw {
+            File::open_rw(path)
+        } else {
+            File::open(path)
+        };
+        file.map_err(move |e: hdf5::Error| -> DfDatasetError {
+            DfDatasetError::Hdf5ErrorDetail {
+                source: e,
+                msg: format!("Error during File::open of dataset {}", path),
+            }
+        })
+    }
+    fn init_impl(file: File) -> Result<Self> {
         match get_dstype(&file) {
             None => Err(DfDatasetError::Hdf5DsTypeNotFoundError),
             Some(dstype) => {
@@ -1183,6 +1257,7 @@ impl Hdf5Dataset {
                     Ok(attr) => match attr.read_scalar::<VarLenUnicode>().unwrap().as_str() {
                         "pcm" => Some(Codec::PCM),
                         "vorbis" => Some(Codec::Vorbis),
+                        "flac" => Some(Codec::FLAC),
                         _ => None,
                     },
                 };
@@ -1208,8 +1283,11 @@ impl Hdf5Dataset {
     fn name(&self) -> String {
         self.file.filename()
     }
+    pub fn ds_type(&self) -> String {
+        self.dstype.to_string().to_lowercase()
+    }
     fn group(&self) -> Result<hdf5::Group> {
-        Ok(self.file.group(&self.dstype.to_string().to_lowercase())?)
+        Ok(self.file.group(&self.ds_type())?)
     }
     pub fn len(&self) -> usize {
         self.group().unwrap().len() as usize
@@ -1223,55 +1301,135 @@ impl Hdf5Dataset {
     pub fn attributes(&self) -> Result<Vec<String>> {
         Ok(self.file.attr_names()?)
     }
-    fn fmt_err(
+    pub fn ds(&self, key: &str) -> Result<hdf5::Dataset> {
+        Ok(self.group()?.dataset(key)?)
+    }
+    #[cfg(not(feature = "flac"))]
+    fn sample_len_flac(&self, _ds: hdf5::Dataset) -> Result<usize> {
+        Err(DfDatasetError::CodecNotSupportedError {
+            codec: Codec::FLAC,
+            ds: format!("{:?}", self.file),
+        })
+    }
+    #[cfg(feature = "flac")]
+    /// Get the sample length of a Flac encoded dataset
+    ///
+    /// Arguments:
+    ///
+    /// * `ds`: `hdf5::Dataset` containing a flac encoded audio sample.
+    fn sample_len_flac(&self, ds: hdf5::Dataset) -> Result<usize> {
+        let reader = claxon::FlacReader::new(ds.as_byte_reader()?)?;
+        Ok(reader.streaminfo().samples.unwrap_or(0) as usize)
+    }
+    #[cfg(not(feature = "vorbis"))]
+    fn sample_len_vorbis(&self, _ds: hdf5::Dataset) -> Result<usize> {
+        Err(DfDatasetError::CodecNotSupportedError {
+            codec: Codec::Vorbis,
+            ds: format!("{:?}", self.file),
+        })
+    }
+    #[cfg(feature = "vorbis")]
+    fn sample_len_vorbis_rdr<T: Read + Seek>(&self, rdr: &mut OggPacketReader<T>) -> Result<usize> {
+        // Seek almost to end to get the last ogg package
+        rdr.seek_bytes(std::io::SeekFrom::End(-4096))?;
+        let mut pkg = rdr.read_packet();
+        if pkg.is_err() {
+            // Maybe seek a little further or start entirely from the beginning.
+            rdr.seek_bytes(std::io::SeekFrom::End(-8192))?;
+            pkg = rdr.read_packet();
+            if pkg.is_err() {
+                rdr.seek_absgp(None, 0)?;
+                pkg = rdr.read_packet();
+            };
+        }
+        // Also check if there are some packges left
+        let mut absgp = 0;
+        while let Some(p) = pkg? {
+            absgp = p.absgp_page();
+            pkg = rdr.read_packet();
+        }
+        Ok(absgp as usize)
+    }
+    #[cfg(feature = "vorbis")]
+    /// Get the sample length of a vorbis encoded dataset
+    ///
+    /// Arguments:
+    ///
+    /// * `ds`: `hdf5::Dataset` containing a vorbis (ogg) encoded audio sample.
+    fn sample_len_vorbis(&self, ds: hdf5::Dataset) -> Result<usize> {
+        let mut rdr = OggPacketReader::new(ds.as_byte_reader()?);
+        self.sample_len_vorbis_rdr(&mut rdr)
+    }
+    fn sample_len_from_ds(&self, ds: hdf5::Dataset) -> Result<usize> {
+        Ok(match self.codec.as_ref().unwrap_or(&Codec::PCM) {
+            Codec::PCM => *ds.shape().last().unwrap_or(&0),
+            Codec::Vorbis => self.sample_len_vorbis(ds)?,
+            Codec::FLAC => self.sample_len_flac(ds)?,
+        })
+    }
+    pub fn sample_len(&self, key: &str) -> Result<usize> {
+        let ds = self.ds(key)?;
+        let n = match ds.attr("n_samples") {
+            Ok(a) => {
+                let n: usize = match a.ndim() {
+                    0 => a.read_scalar::<usize>()?,
+                    1 => a.read_1d()?[0],
+                    _ => unreachable!(),
+                };
+                if n < 100 {
+                    self.sample_len_from_ds(ds)?
+                } else {
+                    n
+                }
+            }
+            Err(_) => self.sample_len_from_ds(ds)?,
+        };
+        Ok(n)
+    }
+    fn match_ch<T, D: ndarray::Dimension>(
         &self,
-        fn_: &'static str,
+        mut x: Array<T, D>,
+        ch_dim: usize,
+        ch_idx: Option<isize>,
+    ) -> Result<Array2<T>> {
+        Ok(match x.ndim() {
+            1 => {
+                // Return in channels first
+                let len = x.len_of(Axis(0));
+                x.into_shape((1, len))?
+            }
+            2 => match ch_idx {
+                Some(-1) => {
+                    let idx = thread_rng()?.uniform(0, x.len_of(Axis(ch_dim)));
+                    x.slice_axis_inplace(Axis(ch_dim), Slice::from(idx..idx + 1));
+                    x
+                }
+                Some(idx) => {
+                    x.slice_axis_inplace(Axis(ch_dim), Slice::from(idx..idx + 1));
+                    x
+                }
+                None => x,
+            }
+            .into_dimensionality()?,
+            n => return Err(DfDatasetError::PcmUnspportedDimension(n)),
+        })
+    }
+    /// Read a PCM encoded sample from an `hdf5::Dataset`.
+    ///
+    /// Arguments:
+    ///
+    /// * `key`: String idendifier to load the dataset.
+    /// * `channel`: Optional channel. `-1` will load a random channel, `None` will return all channels.
+    /// * `r`: Optional range in samples (time axis). `None` will return all samples.
+    pub fn read_pcm(
+        &self,
         key: &str,
-    ) -> impl FnOnce(hdf5::Error) -> DfDatasetError + '_ {
-        let key = key.to_string();
-        let name = self.name();
-        move |e: hdf5::Error| -> DfDatasetError {
-            DfDatasetError::Hdf5ErrorDetail {
-                source: e,
-                msg: format!("Error during {} of dataset {} key {}", fn_, name, key),
-            }
-        }
-    }
-    fn sample_len(&self, key: &str) -> Result<usize> {
-        let ds = self.group()?.dataset(key)?;
-        if *self.codec.as_ref().unwrap_or(&Codec::PCM) == Codec::Vorbis {
-            let s = *ds.shape().last().unwrap(); // length of raw buffer
-            let lastpages = ds
-                .read_slice_1d(s![s - 50 * 1024 / 8..])
-                .map_err(self.fmt_err("sample_len", key))?; // seek to last 50 kB
-            let mut rdr = OggPacketReader::new(Cursor::new(lastpages.as_slice().unwrap()));
-            // Ensure that rdr is at the start of a ogg page
-            rdr.seek_absgp(None, 0).unwrap();
-            let mut absgp = 0;
-            while let Some(pkg) = rdr.read_packet()? {
-                absgp = pkg.absgp_page();
-            }
-            Ok(absgp as usize)
-        } else {
-            Ok(*ds.shape().last().unwrap_or(&0))
-        }
-    }
-    fn sample_shape(&self, key: &str) -> Result<Vec<usize>> {
-        let ds = self.group()?.dataset(key)?;
-        match *self.codec.as_ref().unwrap_or(&Codec::PCM) {
-            Codec::PCM => Ok(ds.shape()),
-            Codec::Vorbis => {
-                let firstpages =
-                    ds.read_slice_1d(s![..512]).map_err(self.fmt_err("sample_shape", key))?;
-                let ident_hdr =
-                    lewton::header::read_header_ident(firstpages.as_slice().unwrap()).unwrap();
-                Ok(vec![ident_hdr.audio_channels.into(), self.sample_len(key)?])
-            }
-        }
-    }
-    pub fn read_pcm(&self, key: &str, r: Option<Range<usize>>) -> Result<Array2<f32>> {
-        let ds = self.group()?.dataset(key)?;
-        let mut arr: ArrayD<f32> = if let Some(r) = r {
+        channel: Option<isize>,
+        r: Option<Range<usize>>,
+    ) -> Result<Array2<f32>> {
+        let ds = self.ds(key)?;
+        let arr = if let Some(r) = r {
+            // Directly to a sliced dataset read
             if r.end > *ds.shape().last().unwrap_or(&0) {
                 return Err(DfDatasetError::PcmRangeToLarge {
                     range: r,
@@ -1279,25 +1437,21 @@ impl Hdf5Dataset {
                 });
             }
             match ds.ndim() {
-                1 => ds.read_slice(s![r]).map_err(self.fmt_err("read_pcm", key))?,
-                2 => ds.read_slice(s![0, r]).map_err(self.fmt_err("read_pcm", key))?, // Just take the first channel for now
+                1 => ds.read_slice(s![r])?,
+                2 => match channel {
+                    Some(-1) => {
+                        let nch = ds.shape()[1];
+                        ds.read_slice(s![thread_rng()?.uniform(0, nch), r])
+                    } // rand ch
+                    Some(channel) => ds.read_slice(s![channel, r]), // specified channel
+                    None => ds.read_slice(s![.., r]),               // all channels
+                }?,
                 n => return Err(DfDatasetError::PcmUnspportedDimension(n)),
             }
         } else {
-            ds.read_dyn::<f32>().map_err(self.fmt_err("read_pcm", key))?
+            ds.read_dyn::<f32>()?
         };
-        #[allow(clippy::branches_sharing_code)]
-        let mut arr = if arr.ndim() == 1 {
-            let len = arr.len_of(Axis(0));
-            arr.into_shape((1, len))?
-        } else {
-            let ch = arr.len_of(Axis(0));
-            if ch > 1 {
-                let idx = thread_rng()?.gen_range(0..ch);
-                arr.slice_axis_inplace(Axis(0), Slice::from(idx..idx + 1));
-            }
-            arr.into_dimensionality()?
-        };
+        let mut arr = self.match_ch(arr, 0, channel)?;
         match self.dtype {
             Some(DType::I16) => arr /= std::i16::MAX as f32,
             Some(DType::F32) => (),
@@ -1309,226 +1463,632 @@ impl Hdf5Dataset {
         }
         Ok(arr)
     }
-    pub fn read_vorbis(&self, key: &str, r: Option<Range<usize>>) -> Result<Array2<f32>> {
-        let ds = self.group()?.dataset(key)?;
-        let encoded = Cursor::new(ds.read_raw::<u8>().map_err(self.fmt_err("read_vorbis", key))?);
-        let mut srr = OggStreamReader::new(encoded)?;
-        let ch = srr.ident_hdr.audio_channels as usize;
-        let mut out: Vec<i16> = Vec::new();
-        while let Some(mut pck) = srr.read_dec_packet_itl()? {
-            out.append(&mut pck);
+    #[cfg(not(feature = "flac"))]
+    fn read_flac(
+        &self,
+        _key: &str,
+        _channel: Option<isize>,
+        _r: Option<Range<usize>>,
+    ) -> Result<Array2<f32>> {
+        Err(DfDatasetError::CodecNotSupportedError {
+            codec: Codec::FLAC,
+            ds: format!("{:?}", self.file),
+        })
+    }
+    #[cfg(feature = "flac")]
+    fn _read_flac<R: std::io::Read>(
+        &self,
+        key: &str,
+        mut reader: claxon::FlacReader<R>,
+    ) -> Result<Array2<f32>> {
+        let info = reader.streaminfo();
+        assert_eq!(
+            info.bits_per_sample, 16,
+            "Flac decoding is only supported for 16 bit samples"
+        );
+        let ch = info.channels as usize;
+        let samples = info.samples.unwrap_or_default() as usize;
+        let mut frame_reader = reader.blocks();
+        let mut out: Array2<f32> = Array2::zeros((ch, samples));
+        let mut block = claxon::Block::empty();
+        let mut idx = 0;
+        loop {
+            let next = match frame_reader.read_next_or_eof(block.into_buffer()) {
+                Ok(Some(n)) => n,
+                Ok(None) => break,
+                Err(e) => {
+                    log::warn!("Error decoding flac dataset {} {:?}", key, e);
+                    if e.to_string().contains("CRC") {
+                        break;
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            };
+            let numel = (next.len() / next.channels()) as usize;
+            debug_assert_eq!(ch, next.channels() as usize);
+            for i in 0..ch {
+                debug_assert!(out.len_of(Axis(1)) >= idx + numel);
+                let mut out_ch = out.slice_mut(s![i, idx..idx + numel]);
+                debug_assert_eq!(out_ch.len(), next.channel(i as u32).len());
+                for (i_s, o_s) in next.channel(i as u32).iter().zip(out_ch.iter_mut()) {
+                    *o_s = *i_s as f32 / std::i16::MAX as f32
+                }
+            }
+            idx += numel;
+            block = next
         }
-        let mut out: Array2<i16> = Array2::from_shape_vec((out.len() / ch, ch), out)?;
-        if ch > 1 {
-            let idx = thread_rng()?.gen_range(0..ch);
-            out.slice_axis_inplace(Axis(1), Slice::from(idx..idx + 1));
-        }
-        debug_assert_eq!(1, out.len_of(Axis(1)));
+        Ok(out)
+    }
+    #[cfg(feature = "flac")]
+    fn read_flac_byte_reader(&self, key: &str) -> Result<Array2<f32>> {
+        let ds = self.ds(key)?;
+        let reader = claxon::FlacReader::new(ds.as_byte_reader()?)?;
+        self._read_flac(key, reader)
+    }
+    #[cfg(feature = "flac")]
+    fn read_flac_ds(&self, key: &str) -> Result<Array2<f32>> {
+        let ds = self.ds(key)?;
+        let encoded = ds.read_1d()?;
+        let reader = claxon::FlacReader::new(encoded.as_slice().unwrap())?;
+        self._read_flac(key, reader)
+    }
+    /// Read a Flac encoded sample from an `hdf5::Dataset`.
+    ///
+    /// Arguments:
+    ///
+    /// * `key`: String idendifier to load the dataset.
+    /// * `channel`: Optional channel. `-1` will load a random channel, `None` will return all channels.
+    /// * `r`: Optional range in samples (time axis). `None` will return all samples.
+    #[cfg(feature = "flac")]
+    fn read_flac(
+        &self,
+        key: &str,
+        channel: Option<isize>,
+        r: Option<Range<usize>>,
+    ) -> Result<Array2<f32>> {
+        let out = self.read_flac_ds(key)?;
+        let mut out = self.match_ch(out, 0, channel)?;
         if let Some(r) = r {
-            out.slice_axis_inplace(Axis(0), Slice::from(r));
+            out.slice_axis_inplace(Axis(1), Slice::from(r));
         }
-        let out = out.mapv(|x| x as f32 / std::i16::MAX as f32);
-        // Transpose to channels first
-        let out_len = out.len_of(Axis(0));
-        Ok(out.into_shape((1, out_len))?)
+        Ok(out)
+    }
+    #[cfg(not(feature = "vorbis"))]
+    fn read_vorbis(
+        &self,
+        _key: &str,
+        _channel: Option<isize>,
+        _r: Option<Range<usize>>,
+    ) -> Result<Array2<f32>> {
+        Err(DfDatasetError::CodecNotSupportedError {
+            codec: Codec::Vorbis,
+            ds: format!("{:?}", self.file),
+        })
+    }
+    #[inline(never)]
+    #[cfg(feature = "vorbis")]
+    /// Read a vorbis encoded sample from an `hdf5::Dataset`.
+    ///
+    /// Arguments:
+    ///
+    /// * `key`: String idendifier to load the dataset.
+    /// * `channel`: Optional channel. `-1` will load a random channel, `None` will return all channels.
+    /// * `r`: Optional range in samples (time axis). `None` will return all samples.
+    fn read_vorbis(
+        &self,
+        key: &str,
+        channel: Option<isize>,
+        r: Option<Range<usize>>,
+    ) -> Result<Array2<f32>> {
+        let ds = self.ds(key)?;
+        let encoded = ds.read_1d()?;
+        let mut rdr = OggPacketReader::new(Cursor::new(encoded.as_slice().unwrap()));
+        let (start, end) = if let Some(r) = r.as_ref() {
+            (r.start, r.end)
+        } else {
+            (0, self.sample_len_vorbis_rdr(&mut rdr)?)
+        };
+        let len = end - start;
+        rdr.seek_absgp(None, 0)?;
+        let mut srr = OggStreamReader::from_ogg_reader(rdr)?;
+        if start > 0 {
+            srr.seek_absgp_pg(start as u64)?
+        }
+        let ch = srr.ident_hdr.audio_channels as usize;
+        let mut pck = loop {
+            match srr.read_dec_packet_itl() {
+                Ok(p) => break p,
+                Err(lewton::VorbisError::BadAudio(
+                    lewton::audio::AudioReadError::AudioIsHeader,
+                )) => (),
+                Err(e) => return Err(e.into()),
+            }
+        };
+
+        let mut out: Vec<i16> = Vec::with_capacity((len + 1024) * ch); // Allocate a little extra
+        while let Some(mut p) = pck {
+            out.append(&mut p);
+            if let Some(pos) = srr.get_last_absgp().map(|p| p as usize) {
+                if pos >= end {
+                    // We might get some extra samples at the end.
+                    out.truncate((out.len() - (pos - end) * ch).max(len * ch));
+                    debug_assert!(out.len() >= len);
+                    break;
+                }
+            }
+            pck = srr.read_dec_packet_itl()?;
+        }
+        let start_pos = (out.len() / ch).saturating_sub(len);
+        let mut out = Array2::from_shape_vec((out.len() / ch, ch), out)?;
+        // We already have a coarse range. The start may contain more samples from its
+        // corresponding ogg page. The end is already exact. Thus, truncate the beginning.
+        let cur_len = out.len_of(Axis(0));
+        out.slice_axis_inplace(
+            Axis(0),
+            Slice::from(start_pos..(len + start_pos).min(cur_len)),
+        );
+        // Select channel
+        let out = self.match_ch(out, 1, channel)?;
+        // Transpose to channels first and convert to float
+        let out = out.t().mapv(|x| x as f32 / std::i16::MAX as f32);
+        Ok(out)
     }
 
     pub fn read(&self, key: &str) -> Result<Array2<f32>> {
         match *self.codec.as_ref().unwrap_or_default() {
-            Codec::PCM => self.read_pcm(key, None),
-            Codec::Vorbis => self.read_vorbis(key, None),
+            Codec::PCM => self.read_pcm(key, Some(0), None),
+            Codec::Vorbis => self.read_vorbis(key, Some(0), None),
+            Codec::FLAC => self.read_flac(key, Some(0), None),
         }
     }
     pub fn read_slc(&self, key: &str, r: Range<usize>) -> Result<Array2<f32>> {
         match *self.codec.as_ref().unwrap_or_default() {
-            Codec::PCM => self.read_pcm(key, Some(r)),
-            Codec::Vorbis => self.read_vorbis(key, Some(r)),
+            Codec::PCM => self.read_pcm(key, Some(0), Some(r)),
+            Codec::Vorbis => self.read_vorbis(key, Some(0), Some(r)),
+            Codec::FLAC => self.read_flac(key, Some(0), Some(r)),
+        }
+    }
+    pub fn read_all_channels(&self, key: &str) -> Result<Array2<f32>> {
+        match *self.codec.as_ref().unwrap_or_default() {
+            Codec::PCM => self.read_pcm(key, None, None),
+            Codec::Vorbis => self.read_vorbis(key, None, None),
+            Codec::FLAC => self.read_flac(key, None, None),
         }
     }
 }
 
-fn unpack_pad<Ts, To, F>(mut f: F, samples: &mut [Sample<Ts>], len: usize) -> Result<ArrayD<To>>
-where
-    Ts: Data,
-    To: Data,
-    F: FnMut(&mut Sample<Ts>) -> &mut ArrayD<To>,
-{
-    let mut out: Vec<ArrayViewMutD<To>> = Vec::with_capacity(samples.len());
-    for sample in samples.iter_mut() {
-        let x: &mut ArrayD<To> = f(sample);
+struct LpParam {
+    sr: usize,
+    cut_off: usize,
+}
 
-        let missing = len.saturating_sub(x.len_of(Axis(1)));
-        if missing > 0 {
-            let mut shape: Vec<usize> = x.shape().into();
-            shape[1] = missing;
-            let tmp: ArrayD<To> = ArrayD::<To>::zeros(shape);
-            x.append(Axis(1), tmp.into_dimensionality()?.view())?;
+fn combine_noises(
+    ch: usize,
+    len: usize,
+    noises: &mut [Array2<f32>],
+    noise_gains: Option<&[f32]>,
+) -> Result<Signal> {
+    let mut rng = thread_rng()?;
+    // Adjust length of noises to clean length
+    for ns in noises.iter_mut() {
+        loop {
+            if len.checked_sub(ns.len_of(Axis(1))).is_some() {
+                // TODO: Remove this clone if ndarray supports repeat
+                ns.append(Axis(1), ns.clone().view())?;
+            } else {
+                break;
+            }
         }
-        out.push(x.view_mut());
-    }
-    let out: Vec<ArrayViewD<To>> = out.iter().map(|s| s.view()).collect();
-    if !out.windows(2).all(|w| w[0].shape() == w[1].shape()) {
-        eprintln!("Shapes do not match!");
-        for outs in out.iter() {
-            eprintln!("  shape: {:?}", outs.shape());
+        let too_large = ns.len_of(Axis(1)).checked_sub(len);
+        if let Some(too_large) = too_large {
+            let start: usize = rng.uniform(0, too_large);
+            ns.slice_collapse(s![.., start..start + len]);
         }
     }
-    Ok(ndarray::stack(Axis(0), out.as_slice())?.into_dyn())
+    // Adjust number of noise channels to clean channels
+    for ns in noises.iter_mut() {
+        while ns.len_of(Axis(0)) > ch {
+            ns.remove_index(Axis(0), rng.uniform(0, ns.len_of(Axis(0))))
+        }
+        while ns.len_of(Axis(0)) < ch {
+            let r = rng.uniform(0, ns.len_of(Axis(0)));
+            let slc = ns.slice(s![r..r + 1, ..]).to_owned();
+            ns.append(Axis(0), slc.view())?;
+        }
+    }
+    // Apply gain to noises
+    if let Some(ns_gains) = noise_gains {
+        for (ns, &g) in noises.iter_mut().zip(ns_gains) {
+            *ns *= 10f32.powf(g / 20.);
+        }
+    }
+    // Average noises
+    let noise = Array2::zeros((ch, len));
+    let noise = noises.iter().fold(noise, |acc, x| acc + x) / ch as f32;
+    Ok(noise)
+}
+
+/// Mix a clean signal with noise signal at given SNR.
+///
+/// Arguments
+///
+/// * `clean` - A clean speech signal of shape `[C, N]`.
+/// * `clean_dist` - An optional distorted speech signal of shape `[C, N]`. If provided, this signal
+///                  will be used for creating the noisy mixture. `clean` may be used as a training
+///                  target and usually contains no or less distortions. This can be used to learn
+///                  some dereverberation or declipping.
+/// * `noise` - A noise signal of shape `[C, N]`. Will be modified in place.
+/// * `snr_db` - Signal to noise ratio in decibel used for mixing.
+/// * `gain_db` - Gain to apply to the clean signal in decibel before mixing.
+/// * `noise_resample`: Optional resample parameters which will be used to apply a low-pass via
+///                     resampling to the noise signal. This may be used to make sure a speech
+///                     signal with a lower sampling rate will also be mixed with noise having the
+///                     same sampling rate.
+fn mix_audio_signal(
+    clean: Array2<f32>,
+    clean_dist: Option<Array2<f32>>,
+    mut noise: Array2<f32>,
+    snr_db: f32,
+    gain_db: f32,
+    noise_resample: Option<LpParam>,
+) -> Result<(Signal, Signal, Signal)> {
+    let len = clean.len_of(Axis(1));
+    if let Some(re) = noise_resample {
+        // Low pass filtering via resampling
+        noise = low_pass_resample(&noise, re.cut_off, re.sr)?;
+        noise.slice_axis_inplace(Axis(1), Slice::from(..len));
+    }
+    // Apply gain to speech
+    let g = 10f32.powf(gain_db / 20.);
+    let mut clean_out = &clean * g;
+    // clean_mix may contain distorted speech
+    let clean_mix = clean_dist.map(|c| &c * g).unwrap_or_else(|| clean_out.clone());
+    // For energy calculation use clean speech to also consider direct-to-reverberant ratio
+    noise *= mix_f(clean_out.view(), noise.view(), snr_db);
+    let mut mixture = clean_mix + &noise;
+    // Guard against clipping
+    let max = &([&clean_out, &noise, &mixture].iter().map(|x| find_max_abs(x.iter())))
+        .collect::<std::result::Result<Vec<f32>, crate::util::UtilsError>>()?;
+    let max = find_max(max)?;
+    if (max - 1.) > 1e-10 {
+        let f = 1. / (max + 1e-10);
+        clean_out *= f;
+        noise *= f;
+        mixture *= f;
+    }
+    Ok((clean_out, noise, mixture))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::collections::BTreeSet;
+    use std::sync::Once;
 
-    use dirs::home_dir;
+    use log::info;
+    use rstest::rstest;
 
     use super::*;
     use crate::util::seed_from_u64;
-    use crate::wav_utils::*;
+    use crate::wav_utils;
 
+    static INIT: Once = Once::new();
+
+    /// Setup function that is only run once, even if called multiple times.
+    fn setup() {
+        INIT.call_once(|| {
+            let _ = env_logger::builder()
+                // Include all events in tests
+                .filter_module("df", log::LevelFilter::max())
+                // Ensure events are captured by `cargo test`
+                .is_test(true)
+                // Ignore errors initializing the logger if tests race to configure it
+                .try_init();
+        });
+    }
+
+    fn calc_rms(x: &[f32]) -> f32 {
+        let n = x.len() as f32;
+        (x.iter().map(|x| x.powi(2)).sum::<f32>() * (1. / n)).sqrt()
+    }
+    /// Calculates the SNR for a given clean signal and a noisy mixture.
+    ///
+    /// Arguments
+    ///
+    /// * `y` - A clean signal iterator.
+    /// * `v` - A noise signal iterator.
+    ///
+    /// `x = s + v`, where x is the resulting mixture.
+    fn calc_snr<'a, I>(s: I, v: I) -> f32
+    where
+        I: IntoIterator<Item = &'a f32>,
+    {
+        let e_clean = s.into_iter().fold(0f32, |acc, x| acc + x.powi(2));
+        let e_noise = v.into_iter().fold(0f32, |acc, x| acc + x.powi(2));
+        10. * (e_clean / e_noise).log10()
+    }
+    /// Calculates the SNR for a given mixture signal and the noise signal.
+    ///
+    /// Arguments
+    ///
+    /// * `x` - A noisy mixture signal iterator.
+    /// * `v` - A noise signal iterator.
+    ///
+    /// `x = s + v`, where `y` is the clean signal component.
+    fn calc_snr_xv<'a, I>(x: I, v: I) -> f32
+    where
+        I: IntoIterator<Item = &'a f32>,
+    {
+        let mut e_clean = 0.;
+        let mut e_noise = 0.;
+        for (xx, xv) in x.into_iter().zip(v.into_iter()) {
+            e_clean += (xx - xv).powi(2);
+            e_noise += xv.powi(2);
+        }
+        10. * (e_clean / e_noise).log10()
+    }
+    /// Calculates the SNR for a given clean signal and a noise/clean mixture.
+    ///
+    /// Arguments
+    ///
+    /// * `s` - A clean signal iterator.
+    /// * `x` - A noisy signal iterator.
+    ///
+    /// `x = s + v`, where v is the noise component.
+    fn calc_snr_sx<'a, I>(s: I, x: I) -> f32
+    where
+        I: IntoIterator<Item = &'a f32>,
+    {
+        let mut e_clean = 0.;
+        let mut e_noise = 0.;
+        for (xs, xx) in s.into_iter().zip(x.into_iter()) {
+            e_clean += xs.powi(2);
+            e_noise += (xx - xs).powi(2);
+        }
+        10. * (e_clean / e_noise).log10()
+    }
+    #[inline]
+    fn is_close(a: &[f32], b: &[f32], rtol: f32, atol: f32) -> Vec<bool> {
+        // like numpy
+        assert_eq!(a.len(), b.len());
+        let mut out = vec![true; b.len()];
+        for ((a_s, b_s), o) in a.iter().zip(b.iter()).zip(out.iter_mut()) {
+            *o = (a_s - b_s).abs() <= atol + rtol * b_s.abs()
+        }
+        out
+    }
+    fn hdf5_noise_keys<'a>() -> BTreeSet<&'a str> {
+        BTreeSet::from([
+            "assets_noise_freesound_573577.wav",
+            "assets_noise_freesound_2530.wav",
+        ])
+    }
+
+    #[test]
+    pub fn test_hdf5_read_pcm() -> Result<()> {
+        seed_from_u64(0);
+        let hdf5 = Hdf5Dataset::new("../assets/noise.hdf5")?;
+        for key in hdf5.keys()?.iter() {
+            dbg!(key);
+            assert!(hdf5_noise_keys().contains(key.as_str()));
+            let mut samples_raw =
+                wav_utils::ReadWav::new(&str::replace(key, "assets_", "../assets/"))?
+                    .samples_arr2()?;
+            dbg!(samples_raw.shape());
+            assert_eq!(hdf5.sample_len(key)?, samples_raw.len_of(Axis(1)));
+            samples_raw.slice_axis_inplace(Axis(0), Slice::from(0..1));
+            let sample_hdf5 = hdf5.read(key)?;
+            dbg!(sample_hdf5.shape());
+            assert_eq!(sample_hdf5.shape(), samples_raw.shape());
+            assert_eq!(sample_hdf5, samples_raw);
+            assert!(dbg!(calc_snr_sx(samples_raw.iter(), sample_hdf5.iter())) > 100.);
+        }
+        Ok(())
+    }
+    #[test]
+    pub fn test_hdf5_read_vorbis() -> Result<()> {
+        seed_from_u64(0);
+        let hdf5 = Hdf5Dataset::new("../assets/noise_vorbis.hdf5")?;
+        for key in hdf5.keys()?.iter() {
+            dbg!(key);
+            assert!(hdf5_noise_keys().contains(key.as_str()));
+            let mut samples_raw =
+                wav_utils::ReadWav::new(&str::replace(key, "assets_", "../assets/"))?
+                    .samples_arr2()?;
+            dbg!(samples_raw.shape());
+            assert_eq!(dbg!(hdf5.sample_len(key)?), samples_raw.len_of(Axis(1)));
+            samples_raw.slice_axis_inplace(Axis(0), Slice::from(0..1));
+            let sample_hdf5 = hdf5.read(key)?;
+            dbg!(sample_hdf5.shape());
+            assert_eq!(sample_hdf5.shape(), samples_raw.shape());
+            assert!(dbg!(calc_snr_sx(samples_raw.iter(), sample_hdf5.iter())) > 25.);
+            let filename = &str::replace(key, "assets_", "../out/").replace(".wav", "_vorbis.wav");
+            wav_utils::write_wav_arr2(filename, sample_hdf5.view(), hdf5.sr.unwrap() as u32)?;
+        }
+        Ok(())
+    }
+    #[test]
+    pub fn test_hdf5_read_flac() -> Result<()> {
+        seed_from_u64(0);
+        let hdf5 = Hdf5Dataset::new("../assets/noise_flac.hdf5")?;
+        for key in hdf5.keys()?.iter() {
+            dbg!(key);
+            assert!(hdf5_noise_keys().contains(key.as_str()));
+            let mut samples_raw =
+                wav_utils::ReadWav::new(&str::replace(key, "assets_", "../assets/"))?
+                    .samples_arr2()?;
+            dbg!(samples_raw.shape());
+            assert_eq!(hdf5.sample_len(key)?, samples_raw.len_of(Axis(1)));
+            samples_raw.slice_axis_inplace(Axis(0), Slice::from(0..1));
+            let sample_hdf5 = hdf5.read(key)?;
+            dbg!(sample_hdf5.shape());
+            assert_eq!(sample_hdf5.shape(), samples_raw.shape());
+            assert_eq!(sample_hdf5, samples_raw);
+            assert!(dbg!(calc_snr_sx(samples_raw.iter(), sample_hdf5.iter())) > 100.);
+            let filename = &str::replace(key, "assets_", "../out/").replace(".wav", "_flac.wav");
+            wav_utils::write_wav_arr2(filename, sample_hdf5.view(), hdf5.sr.unwrap() as u32)?;
+        }
+        Ok(())
+    }
+    #[rstest]
+    #[case("../assets/noise.hdf5", "assets_noise_freesound_573577.wav", 3..4, 100.)]
+    #[case("../assets/noise_flac.hdf5", "assets_noise_freesound_573577.wav", 3..4, 100.)]
+    #[case("../assets/noise_vorbis.hdf5", "assets_noise_freesound_573577.wav", 3..4, 20.)]
+    #[should_panic(expected = "snr")]
+    #[case("../assets/noise_vorbis.hdf5", "assets_noise_freesound_573577.wav", 3..4, 40.)]
+    #[should_panic(expected = "Slice end")]
+    #[case("../assets/noise.hdf5", "assets_noise_freesound_573577.wav", 4..5, 0.)]
+    #[should_panic(expected = "Slice end")]
+    #[case("../assets/noise_flac.hdf5", "assets_noise_freesound_573577.wav", 4..5, 0.)]
+    #[should_panic(expected = "Slice end")]
+    #[case("../assets/noise_vorbis.hdf5", "assets_noise_freesound_573577.wav", 4..5, 0.)]
+    // 2 channel sample
+    #[case("../assets/noise.hdf5", "assets_noise_freesound_2530.wav", 1..4, 100.)]
+    #[case("../assets/noise_flac.hdf5", "assets_noise_freesound_2530.wav", 1..4, 100.)]
+    #[case("../assets/noise_vorbis.hdf5", "assets_noise_freesound_2530.wav", 1..4, 20.)]
+    pub fn test_hdf5_slice(
+        #[case] ds: &str,
+        #[case] key: &str,
+        #[case] r: Range<usize>,
+        #[case] snr: f32,
+    ) {
+        seed_from_u64(0);
+        let hdf5 = Hdf5Dataset::new(ds).unwrap();
+        // "assets_noise_freesound_573577.wav" has a length of approx 4.8s
+        // "assets_noise_freesound_2530.wav" has a length of approx 34.2s and 2 channels
+        let sr = hdf5.sr.unwrap();
+        let r = r.start * sr..r.end * sr;
+        dbg!(&r);
+        let samples_raw = wav_utils::ReadWav::new(&str::replace(key, "assets_", "../assets/"))
+            .unwrap()
+            .samples_arr2()
+            .unwrap()
+            .slice_move(s![0..1, r.clone()]);
+        let samples_hdf5 = hdf5.read_slc(key, r.clone()).unwrap();
+        dbg!(samples_hdf5.shape(), samples_raw.shape());
+        {
+            // Write to disk for debugging
+            let basen = &str::replace(key, "assets_", "../out/");
+            let filename =
+                &str::replace(basen, ".wav", &format!("_{}_{}_raw.wav", &r.start, &r.end));
+            dbg!(hdf5.sample_len(key).unwrap());
+            wav_utils::write_wav_arr2(filename, samples_raw.view(), hdf5.sr.unwrap() as u32)
+                .unwrap();
+            let dsn =
+                &str::replace(ds, "../assets/noise", "").replace('_', "").replace(".hdf5", "");
+            let filename = &str::replace(
+                basen,
+                ".wav",
+                &format!("_{}_{}_{}.wav", &r.start, &r.end, dsn),
+            );
+            dbg!(&filename);
+            wav_utils::write_wav_arr2(filename, samples_raw.view(), hdf5.sr.unwrap() as u32)
+                .unwrap();
+        }
+        assert_eq!(samples_hdf5.shape(), samples_raw.shape());
+        assert!(dbg!(calc_snr_sx(samples_raw.iter(), samples_hdf5.iter())) > snr);
+    }
     #[test]
     pub fn test_mix_audio_signal() -> Result<()> {
-        seed_from_u64(42);
-        // 2ch 10 second speech signal
-        let reader = ReadWav::new("../assets/clean_freesound_33711.wav")?;
-        let (sr, ch) = (reader.sr as u32, reader.channels as u16);
-        let clean = reader.samples_arr2()?;
-        // 1ch shorter then clean
-        let noise1 = ReadWav::new("../assets/noise_freesound_573577.wav")?.samples_arr2()?;
-        // 2ch longer then clean
-        let noise2 = ReadWav::new("../assets/noise_freesound_2530.wav")?.samples_arr2()?;
-        let noise = combine_noises(
-            ch as usize,
-            clean.len_of(Axis(1)),
-            &mut [noise1, noise2],
-            None,
-        )?;
-        let (clean, noise, noisy) =
-            mix_audio_signal(clean, None, noise, 0., 6., None, None).unwrap();
-        dbg!(noisy.len());
-        write_wav_arr2("../out/clean.wav", clean.view(), sr)?;
-        write_wav_arr2("../out/noise.wav", noise.view(), sr)?;
-        write_wav_arr2("../out/noisy.wav", noisy.view(), sr)?;
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_hdf5_read() -> Result<()> {
-        let hdf5 = Hdf5Dataset::new(
-            home_dir().unwrap().join("data/hdf5/EDINBURGH_56.hdf5").to_str().unwrap(),
-        )?;
-        let sr = hdf5.sr.unwrap() as u32;
-        let keys = hdf5.keys()?;
-        let signal = hdf5.read(&keys[0])?;
-        dbg!(signal.shape());
-        let max_len = 3 * sr as usize; // 1 second
-        let key = &keys[0];
-        let signal = hdf5.read_slc(key, 0..max_len.min(hdf5.sample_len(key)?))?;
-        dbg!(signal.shape());
-        let ch = signal.len_of(Axis(0));
-        write_wav_iter("../out/hdf5_signal.wav", &signal, sr, ch as u16)?;
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_hdf5_vorbis_read() -> Result<()> {
-        seed_from_u64(42);
-        let hdf5 = Hdf5Dataset::new(
-            home_dir().unwrap().join("data/hdf5/OWN_NOISES_TRAIN.hdf5").to_str().unwrap(),
-        )?;
-        let sr = hdf5.sr.unwrap() as u32;
-        let keys = hdf5.keys()?;
-        let key = &keys[0];
-        let signal = hdf5.read(key)?;
-        write_wav_arr2("../out/hdf5_signal.wav", signal.view(), sr)?;
-        dbg!(signal.shape());
-        let max_len = 3 * sr as usize;
-        let signal = hdf5.read_slc(key, 0..max_len.min(hdf5.sample_len(key)?))?;
-        dbg!(signal.shape());
-        write_wav_arr2("../out/hdf5_signal_slc.wav", signal.view(), sr)?;
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_data_loader() -> Result<()> {
-        println!("******** Start test_data_loader() ********");
-        seed_from_u64(42);
-        let batch_size = 1;
-        let sr = 48000;
-        let ds_dir = home_dir().unwrap().join("data/hdf5").to_str().unwrap().to_string();
-        let cfg = DatasetConfig::open("../assets/dataset.cfg")?;
-        let builder = DatasetBuilder::new(&ds_dir, sr);
-        let ds = Datasets::new(
-            Arc::new(builder.clone().dataset(cfg.train).build_td_dataset()?),
-            Arc::new(builder.clone().dataset(cfg.valid).build_td_dataset()?),
-            Arc::new(builder.clone().dataset(cfg.test).build_td_dataset()?),
-        );
-        let mut loader = DataLoader::builder(ds).batch_size(batch_size).build()?;
-        loader.start_epoch("train", 1)?;
-        for i in 0..10 {
-            let t0 = Instant::now();
-            let batch = loader.get_batch::<f32>()?.unwrap();
-            dbg!(i, &batch);
-            let t1 = Instant::now();
-            println!("test_data_loader: {:?}", t1 - t0);
-            write_wav_iter(
-                "../out/clean.wav",
-                &batch.speech.slice(s![0, 0, ..]),
-                sr as u32,
-                1,
-            )?;
-            write_wav_iter(
-                "../out/noise.wav",
-                &batch.noise.slice(s![0, 0, ..]),
-                sr as u32,
-                1,
-            )?;
-            write_wav_iter(
-                "../out/noisy.wav",
-                &batch.noisy.slice(s![0, 0, ..]),
-                sr as u32,
-                1,
-            )?;
-            break;
+        seed_from_u64(0);
+        let sr = 48_000;
+        let n = sr;
+        let clean = arr1(rng_uniform(n, -0.1, 0.1)?.as_slice()).into_shape([1, n])?;
+        let noise = arr1(rng_uniform(n, -0.1, 0.1)?.as_slice()).into_shape([1, n])?;
+        let gains = [-6., 0., 6.];
+        let snrs = [-10., -5., 0., 5., 10., 20., 40.];
+        let atol = 1e-4;
+        for clean_rev in [None, Some(clean.clone())] {
+            for gain in gains {
+                for snr in snrs {
+                    let (c, n, m) = mix_audio_signal(
+                        clean.clone(),
+                        clean_rev.clone(),
+                        noise.clone(),
+                        snr,
+                        gain,
+                        None,
+                    )?;
+                    assert_eq!(&c + &n, m);
+                    dbg!(clean_rev.is_some(), gain, snr);
+                    // Input SNR of mixture
+                    let snr_inp_m = calc_snr_xv(m.iter(), n.iter());
+                    assert!(
+                        (snr_inp_m - snr).abs() < atol,
+                        "Input SNR does not match: {}, {}",
+                        snr_inp_m,
+                        snr
+                    );
+                    // Target SNR between noise and target (clean) speech.
+                    let snr_target_c = calc_snr(c.iter(), n.iter());
+                    assert!(
+                        (snr_target_c - snr).abs() < atol,
+                        "Target SNR does not match: {}, {}",
+                        snr_target_c,
+                        snr,
+                    );
+                    // Test the SNR difference between input and target
+                    assert!((snr_inp_m - snr_target_c).abs() < atol);
+                }
+            }
         }
-        loader.start_epoch("train", 2)?;
-        for i in 0..2 {
-            dbg!(i, loader.get_batch::<f32>()?);
-        }
-        println!("Dropping loader");
-        drop(loader);
-        println!("Done");
         Ok(())
     }
-
     #[test]
-    pub fn test_fft_dataset() -> Result<()> {
-        println!("******** Start test_data_loader() ********");
+    pub fn test_cached_valid_dataset() -> Result<()> {
+        use std::collections::BTreeMap;
+
+        setup();
         seed_from_u64(42);
-        let batch_size = 2;
         let fft_size = 960;
         let hop_size = Some(480);
         let nb_erb = Some(32);
-        let nb_spec = None;
+        let nb_spec = Some(32);
         let norm_alpha = None;
         let sr = 48000;
-        let ds_dir = home_dir().unwrap().join("data/hdf5").to_str().unwrap().to_string();
-        let cfg = DatasetConfig::open("../assets/dataset.cfg")?;
-        let builder = DatasetBuilder::new(&ds_dir, sr)
-            .df_params(fft_size, hop_size, nb_erb, nb_spec, norm_alpha);
-        let ds = Datasets::new(
-            Arc::new(builder.clone().dataset(cfg.train).build_fft_dataset()?),
-            Arc::new(builder.clone().dataset(cfg.valid).build_fft_dataset()?),
-            Arc::new(builder.clone().dataset(cfg.test).build_fft_dataset()?),
-        );
-        let mut loader = DataLoader::builder(ds).num_threads(1).batch_size(batch_size).build()?;
-        loader.start_epoch("train", 1)?;
-        for i in 0..2 {
-            let batch = loader.get_batch::<Complex32>()?;
-            if let Some(batch) = batch {
-                dbg!(i, &batch, batch.feat_erb.as_ref().unwrap().shape());
+        let ds_dir = "../assets/";
+        for item in fs::read_dir(Path::new("../assets/"))? {
+            let item = item?.path();
+            if item.is_dir()
+                && item.file_name().unwrap().to_str().unwrap().starts_with("valid_cache_")
+            {
+                info!("Removing existing cache '{:?}'", item);
+                fs::remove_dir_all(item)?;
             }
         }
+        let mut cfg = DatasetConfigJson::open("../assets/dataset.cfg")?;
+        for c in cfg.valid.iter_mut() {
+            c.1 = 10.0; // Set sampling factor
+        }
+        let builder = DatasetBuilder::new(ds_dir, sr)
+            .df_params(fft_size, hop_size, nb_erb, nb_spec, norm_alpha)
+            .max_len(1.);
+        let mut val_ds = builder
+            .cache_valid_dataset(Some(0.02)) // Limit by 20 MB
+            .dataset(cfg.split_config(Split::Valid))
+            .build_fft_dataset()?;
+        let ds_len = val_ds.len();
+        let mut mixture_cache = BTreeMap::new();
+        info!("Dataset length: {}", ds_len);
+        for seed in [42, 43] {
+            for _epoch in 0..2 {
+                val_ds.set_seed(seed);
+                if val_ds.need_generate_keys() {
+                    val_ds.generate_keys()?
+                }
+                for idx in 0..ds_len {
+                    let sample = val_ds.get_sample(idx, Some(seed + idx as u64))?;
+                    let key = (seed, idx);
+                    if let Some(cached_noisy) = mixture_cache.get(&key) {
+                        info!("Found sample {:?} in cache", key);
+                        assert_eq!(sample.noisy, cached_noisy);
+                    } else {
+                        mixture_cache.insert(key, sample.noisy.clone());
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }

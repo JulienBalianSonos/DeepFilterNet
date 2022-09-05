@@ -2,8 +2,12 @@
 *.wav
 *.png
 *.pdf
+assets/hostbs.ini
+.cache*
 out/
 export/
+assets/valid_cache*
+DeepFilterNet/poetry.lock
 
 ### Rust gitignore ###
 

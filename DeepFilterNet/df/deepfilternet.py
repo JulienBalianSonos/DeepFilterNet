@@ -14,8 +14,6 @@ class ModelParams(DfParams):
 
     def __init__(self):
         super().__init__()
-        self.df_order: int = config("DF_ORDER", cast=int, default=5, section=self.section)
-        self.df_lookahead: int = config("DF_LOOKAHEAD", cast=int, default=0, section=self.section)
         self.conv_lookahead: int = config(
             "CONV_LOOKAHEAD", cast=int, default=0, section=self.section
         )
@@ -92,6 +90,7 @@ class Encoder(nn.Module):
         self.df_conv0 = convkxf(2, layer_width, fstride=1, k=k0, lookahead=cl, **kwargs)
         cl = 1 if p.conv_lookahead > 1 else 0
         self.df_conv1 = convkxf(layer_width, layer_width * wf ** 1, lookahead=cl, k=k, **kwargs)
+
         self.erb_bins = p.nb_erb
         self.emb_dim = layer_width * p.nb_erb // 4 * wf ** 2
         self.df_fc_emb = GroupedLinear(
@@ -144,7 +143,7 @@ class ErbDecoder(nn.Module):
         wf = p.conv_width_f
         assert p.nb_erb % 8 == 0, "erb_bins should be divisible by 8"
 
-        self.emb_width = layer_width * wf ** 2
+        self.emb_width = layer_width * wf**2
         self.emb_dim = self.emb_width * (p.nb_erb // 4)
         self.fc_emb = nn.Sequential(
             GroupedLinear(
@@ -162,12 +161,12 @@ class ErbDecoder(nn.Module):
         }
         pkwargs = {"k": 1, "f": 1, "batch_norm": True}
         # convt: TransposedConvolution, convp: Pathway (encoder to decoder) convolutions
-        self.conv3p = convkxf(layer_width * wf ** 2, self.emb_width, **pkwargs)
-        self.convt3 = convkxf(self.emb_width, layer_width * wf ** 2, fstride=1, **kwargs)
-        self.conv2p = convkxf(layer_width * wf ** 2, layer_width * wf ** 2, **pkwargs)
-        self.convt2 = convkxf(layer_width * wf ** 2, layer_width * wf ** 1, **tkwargs)
-        self.conv1p = convkxf(layer_width * wf ** 1, layer_width * wf ** 1, **pkwargs)
-        self.convt1 = convkxf(layer_width * wf ** 1, layer_width * wf ** 0, **tkwargs)
+        self.conv3p = convkxf(layer_width * wf**2, self.emb_width, **pkwargs)
+        self.convt3 = convkxf(self.emb_width, layer_width * wf**2, fstride=1, **kwargs)
+        self.conv2p = convkxf(layer_width * wf**2, layer_width * wf**2, **pkwargs)
+        self.convt2 = convkxf(layer_width * wf**2, layer_width * wf**1, **tkwargs)
+        self.conv1p = convkxf(layer_width * wf**1, layer_width * wf**1, **pkwargs)
+        self.convt1 = convkxf(layer_width * wf**1, layer_width * wf**0, **tkwargs)
         self.conv0p = convkxf(layer_width, layer_width, **pkwargs)
         self.conv0_out = convkxf(layer_width, 1, fstride=1, k=k, act=nn.Sigmoid())
 

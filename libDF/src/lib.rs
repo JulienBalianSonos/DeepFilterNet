@@ -6,7 +6,7 @@ use std::vec::Vec;
 
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
-pub type Complex32 = rustfft::num_complex::Complex32;
+pub type Complex32 = num_complex::Complex32;
 
 pub const MEAN_NORM_INIT: [f32; 2] = [-60., -90.];
 pub const UNIT_NORM_INIT: [f32; 2] = [0.001, 0.0001];
@@ -17,6 +17,7 @@ pub mod transforms;
 #[path = ""]
 mod reexport_dataset_modules {
     pub mod augmentations;
+    pub mod dataloader;
     pub mod dataset;
     pub mod mix_utils;
     pub mod util;
@@ -24,6 +25,8 @@ mod reexport_dataset_modules {
 }
 #[cfg(feature = "dataset")]
 pub use reexport_dataset_modules::*;
+#[cfg(feature = "cache")]
+mod cache;
 
 pub(crate) fn freq2erb(freq_hz: f32) -> f32 {
     9.265 * (freq_hz / (24.7 * 9.265)).ln_1p()
@@ -115,8 +118,10 @@ impl DFState {
             let sin = (0.5 * pi * (i as f64 + 0.5) / window_size_h as f64).sin();
             *w = (0.5 * pi * sin * sin).sin() as f32;
         }
-        let wnorm =
-            1_f32 / window.iter().map(|x| x * x).sum::<f32>() * frame_size as f32 / fft_size as f32;
+        //let wnorm =
+        //1_f32 / window.iter().map(|x| x * x).sum::<f32>() * frame_size as f32 / fft_size as f32;
+        // new formulation from `main` branch
+        let wnorm = 1. / (window_size.pow(2) as f32 / (2 * frame_size) as f32);
         let mean_norm_state = Vec::new();
         let unit_norm_state = Vec::new();
 
@@ -159,10 +164,12 @@ impl DFState {
 
     pub fn analysis(&mut self, input: &[f32], output: &mut [Complex32]) {
         debug_assert_eq!(input.len(), self.frame_size);
+        debug_assert_eq!(output.len(), self.freq_size);
         frame_analysis(input, output, self)
     }
 
     pub fn synthesis(&mut self, input: &mut [Complex32], output: &mut [f32]) {
+        debug_assert_eq!(input.len(), self.freq_size);
         debug_assert_eq!(output.len(), self.frame_size);
         frame_synthesis(input, output, self)
     }
@@ -228,7 +235,7 @@ impl Default for DFState {
 pub fn band_mean_norm_freq(xs: &[Complex32], xout: &mut [f32], state: &mut [f32], alpha: f32) {
     debug_assert_eq!(xs.len(), state.len());
     debug_assert_eq!(xout.len(), state.len());
-    for ((x, s), xo) in xs.iter().zip(state.iter_mut()).zip(xout.iter_mut()) {
+    for (x, s, xo) in zip3(xs.iter(), state.iter_mut(), xout.iter_mut()) {
         let xabs = x.norm();
         *s = xabs * (1. - alpha) + *s * alpha;
         *xo = xabs - *s;
@@ -337,9 +344,11 @@ fn frame_analysis(input: &[f32], output: &mut [Complex32], state: &mut DFState) 
     let (buf_first, buf_second) = buf.split_at_mut(state.window_size - state.frame_size);
     let (window_first, window_second) = state.window.split_at(state.window_size - state.frame_size);
     let analysis_split = state.analysis_mem.len() - state.frame_size;
-    for ((&y, &w), x) in
-        state.analysis_mem.iter().zip(window_first.iter()).zip(buf_first.iter_mut())
-    {
+    for (&y, &w, x) in zip3(
+        state.analysis_mem.iter(),
+        window_first.iter(),
+        buf_first.iter_mut(),
+    ) {
         *x = y * w;
     }
     // Second part of the window on the new input frame
@@ -358,7 +367,7 @@ fn frame_analysis(input: &[f32], output: &mut [Complex32], state: &mut DFState) 
     state
         .fft_forward
         .process_with_scratch(&mut buf, output, &mut state.analysis_scratch)
-        .unwrap();
+        .expect("FFT forward failed");
     // Apply normalization in analysis only
     let norm = state.wnorm;
     for x in output.iter_mut() {
@@ -368,10 +377,14 @@ fn frame_analysis(input: &[f32], output: &mut [Complex32], state: &mut DFState) 
 
 fn frame_synthesis(input: &mut [Complex32], output: &mut [f32], state: &mut DFState) {
     let mut x = state.fft_inverse.make_output_vec();
-    state
+    match state
         .fft_inverse
-        .process_with_scratch(input, &mut x[..], &mut state.synthesis_scratch)
-        .unwrap();
+        .process_with_scratch(input, &mut x, &mut state.synthesis_scratch)
+    {
+        Err(realfft::FftError::InputValues(_, _)) => (),
+        Err(e) => Err(e).unwrap(),
+        Ok(_) => (),
+    }
     apply_window_in_place(&mut x, &state.window);
     let (x_first, x_second) = x.split_at(state.frame_size);
     for ((&xi, &mem), out) in x_first.iter().zip(state.synthesis_mem.iter()).zip(output.iter_mut())
@@ -397,7 +410,7 @@ fn frame_synthesis(input: &mut [Complex32], output: &mut [f32], state: &mut DFSt
 
 fn apply_window(xs: &[f32], window: &[f32]) -> Vec<f32> {
     let mut out = vec![0.; window.len()];
-    for ((&x, &w), o) in xs.iter().zip(window.iter()).zip(out.iter_mut()) {
+    for (&x, &w, o) in zip3(xs.iter(), window.iter(), out.iter_mut()) {
         *o = x * w;
     }
     out
@@ -429,6 +442,15 @@ pub fn post_filter(gains: &mut [f32]) {
         g[2] = (1.0 + beta) * g[2] / (1.0 + beta * (g[2] / g_sin[2]).powi(2));
         g[3] = (1.0 + beta) * g[3] / (1.0 + beta * (g[3] / g_sin[3]).powi(2));
     }
+}
+
+fn zip3<A, B, C>(a: A, b: B, c: C) -> impl Iterator<Item = (A::Item, B::Item, C::Item)>
+where
+    A: IntoIterator,
+    B: IntoIterator,
+    C: IntoIterator,
+{
+    a.into_iter().zip(b.into_iter().zip(c)).map(|(x, (y, z))| (x, y, z))
 }
 
 #[cfg(test)]

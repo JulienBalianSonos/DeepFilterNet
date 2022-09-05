@@ -6,18 +6,18 @@ import time
 import warnings
 from multiprocessing import Pool
 from tempfile import NamedTemporaryFile
-from typing import List
+from typing import List, Optional
 
 import h5py as h5
-import librosa
 import numpy as np
-import soundfile as sf
 import torch
 import torchaudio
 from loguru import logger
+from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
 from df.logger import init_logger
+from df.utils import resample
 
 
 def write_to_h5(
@@ -40,15 +40,31 @@ def write_to_h5(
     """
     if max_freq <= 0:
         max_freq = sr // 2
-    with h5.File(file_name, "w", libver="latest") as f, torch.no_grad():
+    compression_factor = None
+    if codec is not None:
+        compression_factor = 8
+    with h5.File(file_name, "a", libver="latest", swmr=True) as f, torch.no_grad():
+        # Document attributes first
+        f.attrs["db_id"] = int(time.time())
+        f.attrs["db_name"] = os.path.basename(file_name)
+        f.attrs["max_freq"] = max_freq
+        f.attrs["dtype"] = dtype
+        f.attrs["sr"] = sr
+        f.attrs["codec"] = codec
+        # Write encoded/decoded samples
         for key, data_dict in data.items():
-            grp = f.create_group(key)
+            try:
+                grp = f.create_group(key)
+            except ValueError:
+                logger.info(f"Found existing group {key}")
+                grp = f[key]
             dataset = PreProcessingDataset(
                 sr,
                 file_names=data_dict["files"],
                 dtype=dtype,
                 codec=codec,
                 mono=mono,
+                compression=compression_factor,
             )
             loader = DataLoader(dataset, num_workers=num_workers, batch_size=1, shuffle=False)
             # Computes the samples in several worker processes
@@ -57,28 +73,33 @@ def write_to_h5(
                 # Sample is a dict containing a list
                 fn = os.path.relpath(sample["file_name"][0], data_dict["working_dir"])
                 audio: np.ndarray = sample["data"][0].numpy()
-                if audio.shape[1] < sr / 100:  # Should be at least 100 ms
-                    logger.warning(f"Audio {fn} too short: {audio.shape}. Skipping.")
+                if codec in ("flac", "vorbis"):
+                    audio = audio.squeeze()
+                if sample["n_samples"] < sr / 100:  # Should be at least 100 ms
+                    logger.warning(f"Short audio {fn}: {audio.shape}.")
                 progress = i / n_samples * 100
                 logger.info(f"{progress:2.0f}% | Writing file {fn} to the {key} dataset.")
                 if sample["n_samples"] == 0:
                     continue
-                ds = grp.create_dataset(fn.replace("/", "_"), data=audio, compression=compression)
+                ds_key = fn.replace("/", "_")
+                if ds_key in grp:
+                    logger.info(f"Found dataset {ds_key}. Replacing.")
+                    del grp[ds_key]
+                ds = grp.create_dataset(ds_key, data=audio, compression=compression)
                 ds.attrs["n_samples"] = sample["n_samples"]
                 del audio, sample
             logger.info("Added {} samples to the group {}.".format(n_samples, key))
 
-        f.attrs["db_id"] = int(time.time())
-        f.attrs["db_name"] = os.path.basename(file_name)
-        f.attrs["max_freq"] = max_freq
-        f.attrs["dtype"] = dtype
-        f.attrs["sr"] = sr
-        f.attrs["codec"] = codec
-
 
 class PreProcessingDataset(Dataset):
     def __init__(
-        self, sr: int, file_names: List[str] = None, dtype="float32", codec="pcm", mono=False
+        self,
+        sr: int,
+        file_names: List[str] = None,
+        dtype="float32",
+        codec="pcm",
+        mono=False,
+        compression: Optional[int] = None,
     ):
         self.file_names = file_names or []
         self.sr = sr
@@ -92,71 +113,47 @@ class PreProcessingDataset(Dataset):
         if self.codec == "vorbis":
             self.dtype = np.float32
         self.mono = mono
+        self.compression = compression  # -1 - 10 for vorbis, 0-8 for flac
 
-    def read(self, file: str):
+    def read(self, file: str) -> Tensor:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            # Librosa does not support resampling with np.int16, thus do the type
-            # conversation manually
-            x, sr = torchaudio.load(file, normalize=False)
+            meta = torchaudio.info(file)
+            if meta.sample_rate != self.sr:
+                # Load as normalized float32 and resample
+                x, sr = torchaudio.load(file, normalize=True)
+                x = resample(x, sr, new_sr=self.sr, method="kaiser_best")
+            else:
+                x, sr = torchaudio.load(file, normalize=False)
             if self.mono and x.shape[0] > 1:
-                x = x.mean(1, keepdim=True)
-            x = x.numpy()
-            dtype = x.dtype if isinstance(x.dtype, np.dtype) else np.dtype(x.dtype)
-            if sr != self.sr:
-                if not np.issubdtype(dtype, np.floating):
-                    # To float32 so we can resample
-                    x = x.astype(np.float32) / (1 << 15)
-
-                if x.shape[0] == 1:
-                    x = x.squeeze(0)
-                x = librosa.resample(x, sr, target_sr=self.sr, scale=True, res_type="kaiser_best")
-                if x.ndim == 1:
-                    x = x.reshape(1, -1)
-            # Double check dtype, since librosa does not take care of that when it falls
-            # back to audioread or it might be changed due to resampling.
-            dtype = x.dtype if isinstance(x.dtype, np.dtype) else np.dtype(x.dtype)
-            if dtype != self.dtype:
-                if np.issubdtype(dtype, np.floating):
-                    # Convert float to int16 pcm
-                    x = (x * (1 << 15)).astype(self.dtype)
-                elif np.issubdtype(dtype, np.integral):
-                    # Convert int16 pcm to float
-                    x = x.astype(self.dtype) / (1 << 15)
+                x = x.mean(0, keepdim=True)
+            if x.dim() == 1:
+                x = x.reshape(1, -1)
         return x
 
     def __getitem__(self, index):
         fn = self.file_names[index]
         logger.debug(f"Reading audio file {fn}")
         x = self.read(fn)
+        assert x.dim() == 2 and x.shape[0] <= 16, f"Got sample {fn} with unexpected shape {x.shape}"
+        n_samples = x.shape[1]
         if self.codec == "vorbis":
             with NamedTemporaryFile(suffix=".ogg") as tf:
-                if x.shape[-1] > 80 * self.sr:
-                    # Getting segfaults for larger samples with libsnd.
-                    warnings.warn("Max sample length is something around 80s. Truncating.")
-                    x = x[..., : 80 * self.sr]
-                if len(x.shape) > 1 and x.shape[-1] > 16:
-                    # Assume channels first
-                    x = x.transpose()
-                try:
-                    sf.write(tf.name, x, self.sr, format="ogg", subtype="vorbis")
-                except RuntimeError:
-                    warnings.warn(f"Runtime error writing file {fn}, shape {x.shape}")
-                    return {
-                        "file_name": fn,
-                        "data": np.zeros_like(x),
-                        "n_samples": 0,
-                    }
-                # Return binary buffer as numpy array
-                x = np.array(list(tf.read()), dtype=np.uint8)
-        if "noise" in fn.lower() and "_P1" in fn and "_Ch1" in fn:
-            x_p1_ch1 = x
-            x_p1_ch2 = self.read(fn.replace("_Ch1", "_Ch2"))
-            x_p2_ch1 = self.read(fn.replace("_P1", "_P2"))
-            x_p2_ch2 = self.read(fn.replace("_P1", "_P2").replace("_Ch1", "_Ch2"))
-            x = np.stack((x_p1_ch1, x_p1_ch2, x_p2_ch1, x_p2_ch2))
-            fn = fn.replace("_P1_Ch1.wav", "")
-        n_samples = len(x)
+                torchaudio.save(tf.name, x, self.sr, format="vorbis", compression=self.compression)
+                x = np.array(list(tf.read()), dtype=np.uint8)  # Return binary buffer as numpy array
+        elif self.codec == "flac":
+            with NamedTemporaryFile(suffix=".flac") as tf:
+                torchaudio.save(
+                    tf.name,
+                    x,
+                    self.sr,
+                    format="flac",
+                    compression=self.compression,
+                    bits_per_sample=16,
+                )
+                x = np.array(list(tf.read()), dtype=np.uint8)  # Return binary buffer as numpy array
+        else:
+            x = x.numpy()
         return {"file_name": fn, "data": x, "n_samples": n_samples}
 
     def __len__(self):
@@ -204,7 +201,7 @@ if __name__ == "__main__":
     if not args.hdf5_db.endswith(".hdf5"):
         args.hdf5_db += ".hdf5"
 
-    init_logger()
+    init_logger("/tmp/prepare_data.log")
     valid_types = ("speech", "noise", "noisy", "rir")
     if args.type not in valid_types:
         raise ValueError(f"Dataset type must be one of {valid_types}, but got {args.type}")

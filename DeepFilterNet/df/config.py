@@ -11,15 +11,32 @@ T = TypeVar("T")
 
 class DfParams:
     def __init__(self):
+        # Sampling rate used for training
         self.sr: int = config("SR", cast=int, default=48_000, section="DF")
-        self.fft_size: int = config("FFT_SIZE", cast=int, default=384, section="DF")
-        self.hop_size: int = config("HOP_SIZE", cast=int, default=192, section="DF")
-        self.nb_erb: int = config("NB_ERB", cast=int, default=16, section="DF")
-        self.nb_df: int = config("NB_DF", cast=int, default=24, section="DF")
+        # FFT size in samples
+        self.fft_size: int = config("FFT_SIZE", cast=int, default=960, section="DF")
+        # STFT Hop size in samples
+        self.hop_size: int = config("HOP_SIZE", cast=int, default=480, section="DF")
+        # Number of ERB bands
+        self.nb_erb: int = config("NB_ERB", cast=int, default=32, section="DF")
+        # Number of deep filtering bins; DF is applied from 0th to nb_df-th frequency bins
+        self.nb_df: int = config("NB_DF", cast=int, default=96, section="DF")
+        # Normalization decay factor; used for complex and erb features
         self.norm_tau: float = config("NORM_TAU", 1, float, section="DF")
+        # Local SNR minimum value, ground truth will be truncated
         self.lsnr_max: int = config("LSNR_MAX", 35, int, section="DF")
+        # Local SNR maximum value, ground truth will be truncated
         self.lsnr_min: int = config("LSNR_MIN", -15, int, section="DF")
-        self.min_nb_freqs = config("MIN_NB_ERB_FREQS", 1, int, section="DF")
+        # Minimum number of frequency bins per ERB band
+        self.min_nb_freqs = config("MIN_NB_ERB_FREQS", 2, int, section="DF")
+        # Deep Filtering order
+        self.df_order: int = config("DF_ORDER", cast=int, default=5, section="DF")
+        # Deep Filtering look-ahead
+        self.df_lookahead: int = config("DF_LOOKAHEAD", cast=int, default=0, section="DF")
+        # Pad mode. By default, padding will be handled on the input side:
+        # - `input`, which pads the input features passed to the model
+        # - `output`, which pads the output spectrogram corresponding to `df_lookahead`
+        self.pad_mode: str = config("PAD_MODE", default="input_specf", section="DF")
 
 
 class Config:
@@ -33,9 +50,11 @@ class Config:
         self.modified = False
         self.allow_defaults = True
 
-    def load(self, path: Optional[str], config_must_exist=False, allow_defaults=True):
+    def load(
+        self, path: Optional[str], config_must_exist=False, allow_defaults=True, allow_reload=False
+    ):
         self.allow_defaults = allow_defaults
-        if self.parser is not None:
+        if self.parser is not None and not allow_reload:
             raise ValueError("Config already loaded")
         self.parser = ConfigParser()
         self.path = path
@@ -44,10 +63,11 @@ class Config:
                 self.parser.read_file(f)
         else:
             if config_must_exist:
-                raise ValueError("No config file found.")
+                raise ValueError(f"No config file found at '{path}'.")
         if not self.parser.has_section(self.DEFAULT_SECTION):
             self.parser.add_section(self.DEFAULT_SECTION)
         self._fix_clc()
+        self._fix_df()
 
     def use_defaults(self):
         self.load(path=None, config_must_exist=False)
@@ -69,15 +89,17 @@ class Config:
             return "".join(str(v) + cast.delimiter for v in value)[:-1]
         return str(value)
 
-    def set(self, section: str, option: str, value: T, cast: Type[T]):
+    def set(self, option: str, value: T, cast: Type[T], section: Optional[str] = None) -> T:
+        section = self.DEFAULT_SECTION if section is None else section
         section = section.lower()
         if not self.parser.has_section(section):
-            raise ValueError(f"Section not found: {section}")
+            self.parser.add_section(section)
         if self.parser.has_option(section, option):
             if value == self.cast(self.parser.get(section, option), cast):
-                return
+                return value
         self.modified = True
         self.parser.set(section, option, self.tostr(value, cast))
+        return value
 
     def __call__(
         self,
@@ -115,7 +137,7 @@ class Config:
         else:
             value = default
             if save:
-                self.set(section, option, value, cast)
+                self.set(option, value, cast, section)
         return self.cast(value, cast)
 
     def cast(self, value, cast):
@@ -128,6 +150,14 @@ class Config:
                 return False  # type: ignore
             raise ValueError("Parse error")
         return cast(value)
+
+    def get(self, option: str, cast: Type[T] = str, section: Optional[str] = None) -> T:
+        section = self.DEFAULT_SECTION if section is None else section
+        if not self.parser.has_section(section):
+            raise KeyError(section)
+        if not self.parser.has_option(section, option):
+            raise KeyError(option)
+        return self.cast(self.parser.get(section, option), cast)
 
     def read_from_section(
         self, section: str, option: str, default: Any = None, cast: Type = str, save: bool = True
@@ -147,7 +177,7 @@ class Config:
             self.modified = True
         return value
 
-    def overwrite(self, section: str, option: str, value: str):
+    def overwrite(self, section: str, option: str, value: Any):
         if not self.parser.has_section(section):
             return ValueError(f"Section not found: '{section}'")
         if not self.parser.has_option(section, option):
@@ -156,10 +186,23 @@ class Config:
         cast = type(value)
         return self.parser.set(section, option, self.tostr(value, cast))
 
+    def _fix_df(self):
+        """Renaming of some groups/options for compatibility with old models."""
+        if self.parser.has_section("deepfilternet") and self.parser.has_section("df"):
+            sec_deepfilternet = self.parser["deepfilternet"]
+            sec_df = self.parser["df"]
+            if "df_order" in sec_deepfilternet:
+                sec_df["df_order"] = sec_deepfilternet["df_order"]
+                del sec_deepfilternet["df_order"]
+            if "df_lookahead" in sec_deepfilternet:
+                sec_df["df_lookahead"] = sec_deepfilternet["df_lookahead"]
+                del sec_deepfilternet["df_lookahead"]
+
     def _fix_clc(self):
         """Renaming of some groups/options for compatibility with old models."""
         if (
             not self.parser.has_section("deepfilternet")
+            and self.parser.has_section("train")
             and self.parser.get("train", "model") == "convgru5"
         ):
             self.overwrite("train", "model", "deepfilternet")

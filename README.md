@@ -1,13 +1,27 @@
 # DeepFilterNet
-A Low Complexity Speech Enhancement Framework for Full-Band Audio (48kHz) based on Deep Filtering.
-Audio samples from the voice bank/DEMAND test set can be found at https://rikorose.github.io/DeepFilterNet-Samples/
+A Low Complexity Speech Enhancement Framework for Full-Band Audio (48kHz) using on Deep Filtering.
 
-* `libDF` contains Rust code used for data loading and augmentation.
-* `DeepFilterNet` contains Python code including a libDF wrapper for data loading, DeepFilterNet training, testing and visualization.
-* `models` contains DeepFilterNet model weights and config.
+### News
+
+- Original DeepFilterNet Paper: *DeepFilterNet: A Low Complexity Speech Enhancement Framework for Full-Band Audio based on Deep Filtering*
+  - Paper: https://arxiv.org/abs/2110.05588
+  - Samples: https://rikorose.github.io/DeepFilterNet-Samples/
+  - Demo: https://huggingface.co/spaces/hshr/DeepFilterNet
+  - Video Lecture: https://youtu.be/it90gBqkY6k
+
+- New DeepFilterNet2 Paper: *DeepFilterNet2: Towards Real-Time Speech Enhancement on Embedded Devices for Full-Band Audio*
+  - Paper: https://arxiv.org/abs/2205.05474
+  - Samples: https://rikorose.github.io/DeepFilterNet2-Samples/
+  - Demo: https://huggingface.co/spaces/hshr/DeepFilterNet2
 
 ## Usage
-This framework is currently only tested under Linux.
+This framework supports Linux, MacOS and Windows. Training is only tested under Linux. The framework
+is structured as follows:
+
+* `libDF` contains Rust code used for data loading and augmentation.
+* `DeepFilterNet` contains DeepFilterNet code training, evaluation and visualization as well as pretrained model weights.
+* `pyDF` contains a Python wrapper of libDF STFT/ISTFT processing loop.
+* `pyDF-data` contains a Python wrapper of libDF dataset functionality and provides a pytorch data loader.
 
 ### PyPI
 
@@ -17,6 +31,8 @@ Install the DeepFilterNet python package via pip:
 pip install torch torchaudio -f https://download.pytorch.org/whl/cpu/torch_stable.html
 # Install DeepFilterNet
 pip install deepfilternet
+# Or install DeepFilterNet including data loading functionality for training (Linux only)
+pip install deepfilternet[train]
 ```
 
 To enhance noisy audio files using DeepFilterNet run
@@ -40,16 +56,45 @@ pip install maturin poetry
 # Build and install libdf python package required for enhance.py
 maturin develop --release -m pyDF/Cargo.toml
 # Optional: Install libdfdata python package with dataset and dataloading functionality for training
+# Required build dependency: HDF5 headers (e.g. ubuntu: libhdf5-dev)
 maturin develop --release -m pyDF-data/Cargo.toml
 # Install remaining DeepFilterNet python dependencies
 cd DeepFilterNet
-poetry install
+poetry install -E train -E eval # Note: This globally installs DeepFilterNet in your environment
+# Alternatively for developement: Install only dependencies and work with the repository version
+poetry install -E train -E eval --no-root
+# You may need to set the python path
+export PYTHONPATH=$PWD
 ```
 
 To enhance noisy audio files using DeepFilterNet run
 ```bash
-# usage: enhance.py [-h] [--output-dir OUTPUT_DIR] [--model_base_dir MODEL_BASE_DIR] noisy_audio_files [noisy_audio_files ...]
-python DeepFilterNet/df/enhance.py DeepFilterNet/pretrained_models/DeepFilterNet/ path/to/noisy_audio.wav
+$ python DeepFilterNet/df/enhance.py --help
+usage: enhance.py [-h] [--model-base-dir MODEL_BASE_DIR] [--pf] [--output-dir OUTPUT_DIR] [--log-level LOG_LEVEL] [--compensate-delay]
+                  noisy_audio_files [noisy_audio_files ...]
+
+positional arguments:
+  noisy_audio_files     List of noise files to mix with the clean speech file.
+
+optional arguments:
+  -h, --help            show this help message and exit
+  --model-base-dir MODEL_BASE_DIR, -m MODEL_BASE_DIR
+                        Model directory containing checkpoints and config.
+                        To load a pretrained model, you may just provide the model name, e.g. `DeepFilterNet`.
+                        By default, the pretrained DeepFilterNet2 model is loaded.
+  --pf                  Post-filter that slightly over-attenuates very noisy sections.
+  --output-dir OUTPUT_DIR, -o OUTPUT_DIR
+                        Directory in which the enhanced audio files will be stored.
+  --log-level LOG_LEVEL
+                        Logger verbosity. Can be one of (debug, info, error, none)
+  --compensate-delay, -D
+                        Add some paddig to compensate the delay introduced by the real-time STFT/ISTFT implementation.
+
+# Enhance audio with original DeepFilterNet
+python DeepFilterNet/df/enhance.py -m DeepFilterNet path/to/noisy_audio.wav
+
+# Enhance audio with DeepFilterNet2
+python DeepFilterNet/df/enhance.py -m DeepFilterNet2 path/to/noisy_audio.wav
 ```
 
 ### Training
@@ -76,24 +121,69 @@ cd path/to/DeepFilterNet/DeepFilterNet
 #   hdf5_db: Output HDF5 dataset.
 python df/prepare_data.py --sr 48000 speech training_set.txt TRAIN_SET_SPEECH.hdf5
 ```
-All dataset should be made available in one dataset folder for the train script.
+All datasets should be made available in one dataset folder for the train script.
 
 The dataset configuration file should contain 3 entries: "train", "valid", "test". Each of those
-contains a list of datasets (e.g. a speech, noise and a RIR dataset). Optionally a sampling factor
-may be specified that can be used to over/under-sample the dataset. Say, you have a specific dataset
-with transient noises and want to increase the amount of non-stationary noises by oversampling.
+contains a list of datasets (e.g. a speech, noise and a RIR dataset). You can use multiple speech
+or noise dataset. Optionally, a sampling factor may be specified that can be used to over/under-sample
+the dataset. Say, you have a specific dataset with transient noises and want to increase the amount
+of non-stationary noises by oversampling. In most cases you want to set this factor to 1.
 
-File `dataset.cfg`:
+<details>
+  <summary>Dataset config example:</summary>
+<p>
+  
+`dataset.cfg`
+
 ```json
 {
   "train": [
     [
       "TRAIN_SET_SPEECH.hdf5",
       1.0
+    ],
+    [
+      "TRAIN_SET_NOISE.hdf5",
+      1.0
+    ],
+    [
+      "TRAIN_SET_RIR.hdf5",
+      1.0
+    ]
+  ],
+  "valid": [
+    [
+      "VALID_SET_SPEECH.hdf5",
+      1.0
+    ],
+    [
+      "VALID_SET_NOISE.hdf5",
+      1.0
+    ],
+    [
+      "VALID_SET_RIR.hdf5",
+      1.0
+    ]
+  ],
+  "test": [
+    [
+      "TEST_SET_SPEECH.hdf5",
+      1.0
+    ],
+    [
+      "TEST_SET_NOISE.hdf5",
+      1.0
+    ],
+    [
+      "TEST_SET_RIR.hdf5",
+      1.0
     ]
   ]
 }
 ```
+
+</p>
+</details>
 
 Finally, start the training script. The training script may create a model `base_dir` if not
 existing used for logging, some audio samples, model checkpoints, and config. If no config file is
@@ -105,19 +195,31 @@ for a config file.
 python df/train.py path/to/dataset.cfg path/to/data_dir/ path/to/base_dir/
 ```
 
-## Citation
+## Citation Guide
 
-This code accompanies the paper 'DeepFilterNet: A Low Complexity Speech Enhancement Framework for Full-Band Audio based on Deep Filtering'.
+Iy you use this framework, please cite: *DeepFilterNet: A Low Complexity Speech Enhancement Framework for Full-Band Audio based on Deep Filtering*
 
 ```bibtex
-@misc{schröter2021deepfilternet,
+@inproceedings{schroeter2022deepfilternet,
       title={DeepFilterNet: A Low Complexity Speech Enhancement Framework for Full-Band Audio based on Deep Filtering}, 
       author={Hendrik Schröter and Alberto N. Escalante-B. and Tobias Rosenkranz and Andreas Maier},
-      year={2021},
-      eprint={2110.05588},
-      archivePrefix={arXiv},
-      primaryClass={eess.AS}
+      booktitle={ICASSP 2022 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
+      year={2022},
+      organization={IEEE}
 }
+```
+
+If you use the DeepFilterNet2 model, please cite: *DeepFilterNet2: Towards Real-Time Speech Enhancement on Embedded Devices for Full-Band Audio*
+
+```bibtex
+@misc{schroeter2022deepfilternet2,
+  title = {{DeepFilterNet2}: Towards Real-Time Speech Enhancement on Embedded Devices for Full-Band Audio},
+  author = {Schröter, Hendrik and Escalante-B., Alberto N. and Rosenkranz, Tobias and Maier, Andreas},
+  publisher = {arXiv},
+  year = {2022},
+  url = {https://arxiv.org/abs/2205.05474},
+}
+
 ```
 
 ## License
