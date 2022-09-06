@@ -839,7 +839,11 @@ class GroupedLinearEinsum(nn.Module):
         # NOTE HERE is a reshape to replace unflatten since ONNX does not support it
         x = x.reshape(xs[0], xs[1], self.groups, self.ws)  # [..., G, I/G]
         # NOTE avoid einsum since it breaks onnxruntime
-        x = torch.einsum("...gi,...gih->...gh", x, self.weight)  # [..., G, H/G]
+        # x = torch.einsum(
+        # "...gi,...gih->...gh", x, self.weight
+        # )  # [..., G, H/G]
+        x = (self.weight.unsqueeze(0).unsqueeze(0) * x.unsqueeze(-1)).sum(dim=3)
+
         nxs = x.shape
         x = x.reshape(nxs[0], nxs[1], nxs[2] * nxs[3])  # [..., G, I/G]
         # NOTE HERE is a reshape to replace flatten since ONNX does not support it
