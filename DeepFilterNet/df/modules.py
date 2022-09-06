@@ -26,8 +26,12 @@ class Conv2dNormAct(nn.Sequential):
         fpad: bool = True,
         bias: bool = True,
         separable: bool = False,
-        norm_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.BatchNorm2d,
-        activation_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.ReLU,
+        norm_layer: Optional[
+            Callable[..., torch.nn.Module]
+        ] = torch.nn.BatchNorm2d,
+        activation_layer: Optional[
+            Callable[..., torch.nn.Module]
+        ] = torch.nn.ReLU,
     ):
         """Causal Conv2d by delaying the signal for any lookahead.
 
@@ -36,7 +40,9 @@ class Conv2dNormAct(nn.Sequential):
         lookahead = 0  # This needs to be handled on the input feature side
         # Padding on time axis
         kernel_size = (
-            (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+            (kernel_size, kernel_size)
+            if isinstance(kernel_size, int)
+            else tuple(kernel_size)
         )
         if fpad:
             fpad_ = kernel_size[1] // 2 + dilation - 1
@@ -83,8 +89,12 @@ class ConvTranspose2dNormAct(nn.Sequential):
         fpad: bool = True,
         bias: bool = True,
         separable: bool = False,
-        norm_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.BatchNorm2d,
-        activation_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.ReLU,
+        norm_layer: Optional[
+            Callable[..., torch.nn.Module]
+        ] = torch.nn.BatchNorm2d,
+        activation_layer: Optional[
+            Callable[..., torch.nn.Module]
+        ] = torch.nn.ReLU,
     ):
         """Causal ConvTranspose2d.
 
@@ -92,7 +102,11 @@ class ConvTranspose2dNormAct(nn.Sequential):
         """
         # Padding on time axis, with lookahead = 0
         lookahead = 0  # This needs to be handled on the input feature side
-        kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        kernel_size = (
+            (kernel_size, kernel_size)
+            if isinstance(kernel_size, int)
+            else kernel_size
+        )
         if fpad:
             fpad_ = kernel_size[1] // 2
         else:
@@ -177,7 +191,12 @@ def convkxf(
         #   = 1        - (2 - 1) - 1 = 0; => padding = fpad (=1 for k=2)
         padding = (k - 1, fpad)
         modules.append(
-            ("sconvt", nn.ConvTranspose2d(padding=padding, output_padding=convpad, **convkwargs))
+            (
+                "sconvt",
+                nn.ConvTranspose2d(
+                    padding=padding, output_padding=convpad, **convkwargs
+                ),
+            )
         )
     elif mode == "upsample":
         modules.append(("upsample", FreqUpsample(fstride)))
@@ -203,7 +222,9 @@ class FreqUpsample(nn.Module):
         return F.interpolate(x, scale_factor=[1.0, self.f], mode=self.mode)
 
 
-def erb_fb(widths: np.ndarray, sr: int, normalized: bool = True, inverse: bool = False) -> Tensor:
+def erb_fb(
+    widths: np.ndarray, sr: int, normalized: bool = True, inverse: bool = False
+) -> Tensor:
     n_freqs = int(np.sum(widths))
     all_freqs = torch.linspace(0, sr // 2, n_freqs + 1)[:-1]
 
@@ -224,11 +245,15 @@ def erb_fb(widths: np.ndarray, sr: int, normalized: bool = True, inverse: bool =
 
 
 class Mask(nn.Module):
-    def __init__(self, erb_inv_fb: Tensor, post_filter: bool = False, eps: float = 1e-12):
+    def __init__(
+        self, erb_inv_fb: Tensor, post_filter: bool = False, eps: float = 1e-12
+    ):
         super().__init__()
         self.erb_inv_fb: Tensor
         self.register_buffer("erb_inv_fb", erb_inv_fb)
-        self.clamp_tensor = torch.__version__ > "1.9.0" or torch.__version__ == "1.9.0"
+        self.clamp_tensor = (
+            torch.__version__ > "1.9.0" or torch.__version__ == "1.9.0"
+        )
         self.post_filter = post_filter
         self.eps = eps
 
@@ -242,10 +267,16 @@ class Mask(nn.Module):
             [1]: Valin et al.: A Perceptually-Motivated Approach for Low-Complexity, Real-Time Enhancement of Fullband Speech.
         """
         mask_sin = mask * torch.sin(np.pi * mask / 2)
-        mask_pf = (1 + beta) * mask / (1 + beta * mask.div(mask_sin.clamp_min(self.eps)).pow(2))
+        mask_pf = (
+            (1 + beta)
+            * mask
+            / (1 + beta * mask.div(mask_sin.clamp_min(self.eps)).pow(2))
+        )
         return mask_pf
 
-    def forward(self, spec: Tensor, mask: Tensor, atten_lim: Optional[Tensor] = None) -> Tensor:
+    def forward(
+        self, spec: Tensor, mask: Tensor, atten_lim: Optional[Tensor] = None
+    ) -> Tensor:
         # spec (real) [B, 1, T, F, 2], F: freq_bins
         # mask (real): [B, 1, T, Fe], Fe: erb_bins
         # atten_lim: [B]
@@ -287,7 +318,9 @@ class ExponentialUnitNorm(nn.Module):
         self.alpha = alpha
         self.eps = eps
         self.init_state: Tensor
-        s = torch.from_numpy(unit_norm_init(num_freq_bins)).view(1, 1, num_freq_bins, 1)
+        s = torch.from_numpy(unit_norm_init(num_freq_bins)).view(
+            1, 1, num_freq_bins, 1
+        )
         self.register_buffer("init_state", s)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -335,13 +368,17 @@ class DfOp(nn.Module):
             "real_hidden_state_loop": self.forward_real_hidden_state_loop,
         }
         if method not in forward_methods.keys():
-            raise NotImplementedError(f"`method` must be one of {forward_methods.keys()}")
+            raise NotImplementedError(
+                f"`method` must be one of {forward_methods.keys()}"
+            )
         if method == "real_hidden_state_loop":
             assert self.freq_bins >= self.df_bins
             self.spec_buf: Tensor
             # Currently only designed for batch size of 1
             self.register_buffer(
-                "spec_buf", torch.zeros(1, 1, self.df_order, self.freq_bins, 2), persistent=False
+                "spec_buf",
+                torch.zeros(1, 1, self.df_order, self.freq_bins, 2),
+                persistent=False,
             )
         self.forward = forward_methods[method]
 
@@ -352,15 +389,26 @@ class DfOp(nn.Module):
         b, _, t, _, _ = spec.shape
         f = self.df_bins
         padded = spec_pad(
-            spec[..., : self.df_bins, :].squeeze(1), self.df_order, self.df_lookahead, dim=-3
+            spec[..., : self.df_bins, :].squeeze(1),
+            self.df_order,
+            self.df_lookahead,
+            dim=-3,
         )
 
         spec_f = torch.zeros((b, t, f, 2), device=spec.device)
         for i in range(self.df_order):
-            spec_f[..., 0] += padded[:, i : i + t, ..., 0] * coefs[:, :, i, :, 0]
-            spec_f[..., 0] -= padded[:, i : i + t, ..., 1] * coefs[:, :, i, :, 1]
-            spec_f[..., 1] += padded[:, i : i + t, ..., 1] * coefs[:, :, i, :, 0]
-            spec_f[..., 1] += padded[:, i : i + t, ..., 0] * coefs[:, :, i, :, 1]
+            spec_f[..., 0] += (
+                padded[:, i : i + t, ..., 0] * coefs[:, :, i, :, 0]
+            )
+            spec_f[..., 0] -= (
+                padded[:, i : i + t, ..., 1] * coefs[:, :, i, :, 1]
+            )
+            spec_f[..., 1] += (
+                padded[:, i : i + t, ..., 1] * coefs[:, :, i, :, 0]
+            )
+            spec_f[..., 1] += (
+                padded[:, i : i + t, ..., 0] * coefs[:, :, i, :, 1]
+            )
         return assign_df(spec, spec_f.unsqueeze(1), self.df_bins, alpha)
 
     def forward_real_strided(
@@ -371,7 +419,10 @@ class DfOp(nn.Module):
         # coefs (real) [B, T, O, F, 2]
         # alpha (real) [B, T, 1]
         padded = as_strided(
-            spec[..., : self.df_bins, :].squeeze(1), self.df_order, self.df_lookahead, dim=-3
+            spec[..., : self.df_bins, :].squeeze(1),
+            self.df_order,
+            self.df_lookahead,
+            dim=-3,
         )
         # Complex numbers are not supported by onnx
         re = padded[..., 0] * coefs[..., 0]
@@ -389,9 +440,14 @@ class DfOp(nn.Module):
         # coefs (real) [B, T, O, F, 2]
         # alpha (real) [B, T, 1]
         padded = spec_pad(
-            spec[..., : self.df_bins, :].squeeze(1), self.df_order, self.df_lookahead, dim=-3
+            spec[..., : self.df_bins, :].squeeze(1),
+            self.df_order,
+            self.df_lookahead,
+            dim=-3,
         )
-        padded = padded.unfold(dimension=1, size=self.df_order, step=1)  # [B, T, F, 2, O]
+        padded = padded.unfold(
+            dimension=1, size=self.df_order, step=1
+        )  # [B, T, F, 2, O]
         padded = padded.permute(0, 1, 4, 2, 3)
         spec_f = torch.empty_like(padded)
         spec_f[..., 0] = padded[..., 0] * coefs[..., 0]  # re1
@@ -409,9 +465,14 @@ class DfOp(nn.Module):
         # coefs (real) [B, T, O, F, 2]
         # alpha (real) [B, T, 1]
         padded = as_strided(
-            spec[..., : self.df_bins, :].squeeze(1), self.df_order, self.df_lookahead, dim=-3
+            spec[..., : self.df_bins, :].squeeze(1),
+            self.df_order,
+            self.df_lookahead,
+            dim=-3,
         )
-        spec_f = torch.sum(torch.view_as_complex(padded) * torch.view_as_complex(coefs), dim=2)
+        spec_f = torch.sum(
+            torch.view_as_complex(padded) * torch.view_as_complex(coefs), dim=2
+        )
         spec_f = torch.view_as_real(spec_f)
         return assign_df(spec, spec_f.unsqueeze(1), self.df_bins, alpha)
 
@@ -426,7 +487,9 @@ class DfOp(nn.Module):
         assert (
             spec.shape[2] == self.df_order
         ), "This forward method needs spectrogram buffer with `df_order` time steps as input"
-        assert coefs.shape[1] == 1, "This forward method is only valid for 1 time step"
+        assert (
+            coefs.shape[1] == 1
+        ), "This forward method is only valid for 1 time step"
         sre, sim = spec[..., : self.df_bins, :].split(1, -1)
         cre, cim = coefs.split(1, -1)
         outr = torch.sum(sre * cre - sim * cim, dim=2).squeeze(-1)
@@ -439,7 +502,9 @@ class DfOp(nn.Module):
             alpha,
         )
 
-    def forward_real_hidden_state_loop(self, spec: Tensor, coefs: Tensor, alpha: Tensor) -> Tensor:
+    def forward_real_hidden_state_loop(
+        self, spec: Tensor, coefs: Tensor, alpha: Tensor
+    ) -> Tensor:
         # Version5: Designed for onnx export. `spec` buffer handling is done via a torch buffer.
 
         # spec (real) [B, 1, T, F', 2]
@@ -455,7 +520,9 @@ class DfOp(nn.Module):
             outi = torch.sum(sre * cim + sim * cre, dim=2).squeeze(-1)
             spec_f = torch.stack((outr, outi), dim=-1)
             spec_out[:, :, t] = assign_df(
-                self.spec_buf[:, :, self.df_order - self.df_lookahead - 1].unsqueeze(2),
+                self.spec_buf[
+                    :, :, self.df_order - self.df_lookahead - 1
+                ].unsqueeze(2),
                 spec_f.unsqueeze(1),
                 self.df_bins,
                 alpha[:, t],
@@ -463,18 +530,24 @@ class DfOp(nn.Module):
         return spec_out
 
 
-def assign_df(spec: Tensor, spec_f: Tensor, df_bins: int, alpha: Optional[Tensor]):
+def assign_df(
+    spec: Tensor, spec_f: Tensor, df_bins: int, alpha: Optional[Tensor]
+):
     spec_out = spec.clone()
     if alpha is not None:
         b = spec.shape[0]
         alpha = alpha.view(b, 1, -1, 1, 1)
-        spec_out[..., :df_bins, :] = spec_f * alpha + spec[..., :df_bins, :] * (1 - alpha)
+        spec_out[..., :df_bins, :] = spec_f * alpha + spec[..., :df_bins, :] * (
+            1 - alpha
+        )
     else:
         spec_out[..., :df_bins, :] = spec_f
     return spec_out
 
 
-def spec_pad(x: Tensor, window_size: int, lookahead: int, dim: int = 0) -> Tensor:
+def spec_pad(
+    x: Tensor, window_size: int, lookahead: int, dim: int = 0
+) -> Tensor:
     pad = [0] * x.dim() * 2
     if dim >= 0:
         pad[(x.dim() - dim - 1) * 2] = window_size - lookahead - 1
@@ -485,7 +558,9 @@ def spec_pad(x: Tensor, window_size: int, lookahead: int, dim: int = 0) -> Tenso
     return F.pad(x, pad)
 
 
-def as_strided(x: Tensor, window_size: int, lookahead: int, step: int = 1, dim: int = 0) -> Tensor:
+def as_strided(
+    x: Tensor, window_size: int, lookahead: int, step: int = 1, dim: int = 0
+) -> Tensor:
     shape = list(x.shape)
     shape.insert(dim + 1, window_size)
     x = spec_pad(x, window_size, lookahead, dim=dim)
@@ -531,16 +606,23 @@ class GroupedGRULayer(nn.Module):
         self.num_directions = 2 if bidirectional else 1
         self.groups = groups
         self.batch_first = batch_first
-        assert (self.hidden_size % groups) == 0, "Hidden size must be divisible by groups"
+        assert (
+            self.hidden_size % groups
+        ) == 0, "Hidden size must be divisible by groups"
         self.layers = nn.ModuleList(
-            (nn.GRU(self.input_size, self.hidden_size, **kwargs) for _ in range(groups))
+            (
+                nn.GRU(self.input_size, self.hidden_size, **kwargs)
+                for _ in range(groups)
+            )
         )
 
     def flatten_parameters(self):
         for layer in self.layers:
             layer.flatten_parameters()
 
-    def get_h0(self, batch_size: int = 1, device: torch.device = torch.device("cpu")):
+    def get_h0(
+        self, batch_size: int = 1, device: torch.device = torch.device("cpu")
+    ):
         return torch.zeros(
             self.groups * self.num_directions,
             batch_size,
@@ -548,7 +630,9 @@ class GroupedGRULayer(nn.Module):
             device=device,
         )
 
-    def forward(self, input: Tensor, h0: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+    def forward(
+        self, input: Tensor, h0: Optional[Tensor] = None
+    ) -> Tuple[Tensor, Tensor]:
         # input shape: [B, T, I] if batch_first else [T, B, I], B: batch_size, I: input_size
         # state shape: [G*D, B, H], where G: groups, D: num_directions, H: hidden_size
 
@@ -561,7 +645,9 @@ class GroupedGRULayer(nn.Module):
         for i, layer in enumerate(self.layers):
             o, s = layer(
                 input[..., i * self.input_size : (i + 1) * self.input_size],
-                h0[i * self.num_directions : (i + 1) * self.num_directions].detach(),
+                h0[
+                    i * self.num_directions : (i + 1) * self.num_directions
+                ].detach(),
             )
             outputs.append(o)
             outstates.append(s)
@@ -618,26 +704,39 @@ class GroupedGRU(nn.Module):
         self.grus: List[GroupedGRULayer] = nn.ModuleList()  # type: ignore
         self.grus.append(GroupedGRULayer(input_size, hidden_size, **kwargs))
         for _ in range(1, num_layers):
-            self.grus.append(GroupedGRULayer(hidden_size, hidden_size, **kwargs))
+            self.grus.append(
+                GroupedGRULayer(hidden_size, hidden_size, **kwargs)
+            )
         self.flatten_parameters()
 
     def flatten_parameters(self):
         for gru in self.grus:
             gru.flatten_parameters()
 
-    def get_h0(self, batch_size: int, device: torch.device = torch.device("cpu")) -> Tensor:
+    def get_h0(
+        self, batch_size: int, device: torch.device = torch.device("cpu")
+    ) -> Tensor:
         return torch.zeros(
-            (self.num_layers * self.groups * self.num_directions, batch_size, self.hidden_size),
+            (
+                self.num_layers * self.groups * self.num_directions,
+                batch_size,
+                self.hidden_size,
+            ),
             device=device,
         )
 
-    def forward(self, input: Tensor, state: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+    def forward(
+        self, input: Tensor, state: Optional[Tensor] = None
+    ) -> Tuple[Tensor, Tensor]:
         dim0, dim1, _ = input.shape
         b = dim0 if self.batch_first else dim1
         if state is None:
             state = self.get_h0(b, input.device)
         output = torch.zeros(
-            dim0, dim1, self.hidden_size * self.num_directions * self.groups, device=input.device
+            dim0,
+            dim1,
+            self.hidden_size * self.num_directions * self.groups,
+            device=input.device,
         )
         outstates = []
         h = self.groups * self.num_directions
@@ -646,7 +745,9 @@ class GroupedGRU(nn.Module):
             outstates.append(s)
             if self.shuffle and i < self.num_layers - 1:
                 input = (
-                    input.view(dim0, dim1, -1, self.groups).transpose(2, 3).reshape(dim0, dim1, -1)
+                    input.view(dim0, dim1, -1, self.groups)
+                    .transpose(2, 3)
+                    .reshape(dim0, dim1, -1)
                 )
             if self.add_outputs:
                 output += input
@@ -675,13 +776,20 @@ class SqueezedGRU(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.linear_in = nn.Sequential(
-            GroupedLinearEinsum(input_size, hidden_size, linear_groups), linear_act_layer()
+            GroupedLinearEinsum(input_size, hidden_size, linear_groups),
+            linear_act_layer(),
         )
-        self.gru = nn.GRU(hidden_size, hidden_size, num_layers=num_layers, batch_first=batch_first)
+        self.gru = nn.GRU(
+            hidden_size,
+            hidden_size,
+            num_layers=num_layers,
+            batch_first=batch_first,
+        )
         self.gru_skip = gru_skip_op() if gru_skip_op is not None else None
         if output_size is not None:
             self.linear_out = nn.Sequential(
-                GroupedLinearEinsum(hidden_size, output_size, linear_groups), linear_act_layer()
+                GroupedLinearEinsum(hidden_size, output_size, linear_groups),
+                linear_act_layer(),
             )
         else:
             self.linear_out = nn.Identity()
@@ -711,7 +819,54 @@ class GroupedLinearEinsum(nn.Module):
         self.register_parameter(
             "weight",
             Parameter(
-                torch.zeros(groups, input_size // groups, hidden_size // groups), requires_grad=True
+                torch.zeros(
+                    groups, input_size // groups, hidden_size // groups
+                ),
+                requires_grad=True,
+            ),
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))  # type: ignore
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [..., I]
+        # x = x.unflatten(-1, (self.groups, self.ws))  # [..., G, I/G]
+        xs = x.shape
+        # NOTE this make big assumption that all will have 3 axis
+        assert len(xs) == 3, xs
+        # NOTE HERE is a reshape to replace unflatten since ONNX does not support it
+        x = x.reshape(xs[0], xs[1], self.groups, self.ws)  # [..., G, I/G]
+        # NOTE avoid einsum since it breaks onnxruntime
+        x = torch.einsum("...gi,...gih->...gh", x, self.weight)  # [..., G, H/G]
+        nxs = x.shape
+        x = x.reshape(nxs[0], nxs[1], nxs[2] * nxs[3])  # [..., G, I/G]
+        # NOTE HERE is a reshape to replace flatten since ONNX does not support it
+        # x = x.flatten(2, 3)  # [B, T, H]
+        return x
+
+
+class OLDGroupedLinearEinsum(nn.Module):
+    input_size: Final[int]
+    hidden_size: Final[int]
+    groups: Final[int]
+
+    def __init__(self, input_size: int, hidden_size: int, groups: int = 1):
+        super().__init__()
+        # self.weight: Tensor
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.groups = groups
+        assert input_size % groups == 0
+        self.ws = input_size // groups
+        self.register_parameter(
+            "weight",
+            Parameter(
+                torch.zeros(
+                    groups, input_size // groups, hidden_size // groups
+                ),
+                requires_grad=True,
             ),
         )
         self.reset_parameters()
@@ -733,7 +888,13 @@ class GroupedLinear(nn.Module):
     groups: Final[int]
     shuffle: Final[bool]
 
-    def __init__(self, input_size: int, hidden_size: int, groups: int = 1, shuffle: bool = True):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        groups: int = 1,
+        shuffle: bool = True,
+    ):
         super().__init__()
         assert input_size % groups == 0
         assert hidden_size % groups == 0
@@ -750,19 +911,27 @@ class GroupedLinear(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         outputs: List[Tensor] = []
         for i, layer in enumerate(self.layers):
-            outputs.append(layer(x[..., i * self.input_size : (i + 1) * self.input_size]))
+            outputs.append(
+                layer(x[..., i * self.input_size : (i + 1) * self.input_size])
+            )
         output = torch.cat(outputs, dim=-1)
         if self.shuffle:
             orig_shape = output.shape
             output = (
-                output.view(-1, self.hidden_size, self.groups).transpose(-1, -2).reshape(orig_shape)
+                output.view(-1, self.hidden_size, self.groups)
+                .transpose(-1, -2)
+                .reshape(orig_shape)
             )
         return output
 
 
 class LocalSnrTarget(nn.Module):
     def __init__(
-        self, ws: int = 20, db: bool = True, ws_ns: Optional[int] = None, target_snr_range=None
+        self,
+        ws: int = 20,
+        db: bool = True,
+        ws_ns: Optional[int] = None,
+        target_snr_range=None,
     ):
         super().__init__()
         self.ws = self.calc_ws(ws)
@@ -777,14 +946,22 @@ class LocalSnrTarget(nn.Module):
         ws = 1 + ws / (p.hop_size / p.sr * 1000)  # consider hop_size
         return max(int(round(ws)), 1)
 
-    def forward(self, clean: Tensor, noise: Tensor, max_bin: Optional[int] = None) -> Tensor:
+    def forward(
+        self, clean: Tensor, noise: Tensor, max_bin: Optional[int] = None
+    ) -> Tensor:
         # clean: [B, 1, T, F]
         # out: [B, T']
         if max_bin is not None:
             clean = as_complex(clean[..., :max_bin])
             noise = as_complex(noise[..., :max_bin])
         return (
-            local_snr(clean, noise, window_size=self.ws, db=self.db, window_size_ns=self.ws_ns)[0]
+            local_snr(
+                clean,
+                noise,
+                window_size=self.ws,
+                db=self.db,
+                window_size_ns=self.ws_ns,
+            )[0]
             .clamp(self.range[0], self.range[1])
             .squeeze(1)
         )
@@ -840,17 +1017,29 @@ def test_grouped_gru():
 
     # Should be exportable as raw nn.Module
     torch.onnx.export(
-        m, (input, h0), "out/grouped.onnx", example_outputs=(out, hout), opset_version=13
+        m,
+        (input, h0),
+        "out/grouped.onnx",
+        example_outputs=(out, hout),
+        opset_version=13,
     )
     # Should be exportable as traced
     m = torch.jit.trace(m, (input, h0))
     torch.onnx.export(
-        m, (input, h0), "out/grouped.onnx", example_outputs=(out, hout), opset_version=13
+        m,
+        (input, h0),
+        "out/grouped.onnx",
+        example_outputs=(out, hout),
+        opset_version=13,
     )
     # and as scripted module
     m = torch.jit.script(m)
     torch.onnx.export(
-        m, (input, h0), "out/grouped.onnx", example_outputs=(out, hout), opset_version=13
+        m,
+        (input, h0),
+        "out/grouped.onnx",
+        example_outputs=(out, hout),
+        opset_version=13,
     )
 
     # now grouped gru
@@ -864,12 +1053,20 @@ def test_grouped_gru():
     # Should be exportable as traced
     m = torch.jit.trace(m, (input, h0))
     torch.onnx.export(
-        m, (input, h0), "out/grouped.onnx", example_outputs=(out, hout), opset_version=13
+        m,
+        (input, h0),
+        "out/grouped.onnx",
+        example_outputs=(out, hout),
+        opset_version=13,
     )
     # and scripted module
     m = torch.jit.script(m)
     torch.onnx.export(
-        m, (input, h0), "out/grouped.onnx", example_outputs=(out, hout), opset_version=13
+        m,
+        (input, h0),
+        "out/grouped.onnx",
+        example_outputs=(out, hout),
+        opset_version=13,
     )
 
 
@@ -880,7 +1077,9 @@ def test_erb():
     config.use_defaults()
     p = ModelParams()
     n_freq = p.fft_size // 2 + 1
-    df_state = libdf.DF(sr=p.sr, fft_size=p.fft_size, hop_size=p.hop_size, nb_bands=p.nb_erb)
+    df_state = libdf.DF(
+        sr=p.sr, fft_size=p.fft_size, hop_size=p.hop_size, nb_bands=p.nb_erb
+    )
     erb = erb_fb(df_state.erb_widths(), p.sr)
     erb_inverse = erb_fb(df_state.erb_widths(), p.sr, inverse=True)
     input = torch.randn((1, 1, 1, n_freq), dtype=torch.complex64)
@@ -906,7 +1105,9 @@ def test_unit_norm():
     spec = torch.randn(b, 1, t, F, 2)
     alpha = get_norm_alpha(log=False)
     # Expects complex input of shape [C, T, F]
-    norm_lib = torch.as_tensor(unit_norm(torch.view_as_complex(spec).squeeze(1).numpy(), alpha))
+    norm_lib = torch.as_tensor(
+        unit_norm(torch.view_as_complex(spec).squeeze(1).numpy(), alpha)
+    )
     m = ExponentialUnitNorm(alpha, F)
     norm_torch = torch.view_as_complex(m(spec).squeeze(1))
     assert torch.allclose(norm_lib.real, norm_torch.real)
@@ -946,7 +1147,9 @@ def test_dfop():
     out5 = torch.zeros_like(out1)
     for i in range(t):
         out5[:, :, i] = dfop(
-            spec_padded[:, :, i : i + o], coefs[:, i].unsqueeze(1), alpha[:, i].unsqueeze(1)
+            spec_padded[:, :, i : i + o],
+            coefs[:, i].unsqueeze(1),
+            alpha[:, i].unsqueeze(1),
         )
     torch.testing.assert_allclose(out1, out5)
     # Forward method that does the padding/lookahead handling using an internal hidden state.
