@@ -92,22 +92,18 @@ def export(
             "lsnr": lsnr,
         },
     )
-
-    # NOTE ONNX runtime do not support einsum
-
-    # sess = onnxruntime.InferenceSession(enc_path)
-    # out = sess.run(
-    # ("e0", "e1", "e2", "e3", "emb", "c0", "lsnr"),
-    # {"feat_erb": feat_erb.numpy(), "feat_spec": feat_spec.numpy()},
-    # )
-    # torch.testing.assert_allclose(e0, out[0])
-    # torch.testing.assert_allclose(e1, out[1])
-    # torch.testing.assert_allclose(e2, out[2])
-    # torch.testing.assert_allclose(e3, out[3])
-    # torch.testing.assert_allclose(emb, out[4])
-    # torch.testing.assert_allclose(c0, out[5])
-    # torch.testing.assert_allclose(lsnr, out[6])
-    # raise Exception("Good encoder is jit.script")
+    sess = onnxruntime.InferenceSession(enc_path)
+    out = sess.run(
+        ("e0", "e1", "e2", "e3", "emb", "c0", "lsnr"),
+        {"feat_erb": feat_erb.numpy(), "feat_spec": feat_spec.numpy()},
+    )
+    torch.testing.assert_allclose(e0, out[0])
+    torch.testing.assert_allclose(e1, out[1])
+    torch.testing.assert_allclose(e2, out[2])
+    torch.testing.assert_allclose(e3, out[3])
+    torch.testing.assert_allclose(emb, out[4])
+    torch.testing.assert_allclose(c0, out[5])
+    torch.testing.assert_allclose(lsnr, out[6])
 
     print("exporting decoder")
     args = (emb.clone(), e3, e2, e1, e0)
@@ -147,19 +143,20 @@ def export(
             "emb": emb,
         },
     )
-    # NOTE einsum not supported
-    # sess = onnxruntime.InferenceSession(os.path.join(output_dir, "dec.onnx"))
-    # out = sess.run(
-    # ("m",),
-    # {
-    # "emb": emb.numpy(),
-    # "e3": e3.numpy(),
-    # "e2": e2.numpy(),
-    # "e1": e1.numpy(),
-    # "e0": e0.numpy(),
-    # },
-    # )
-    # torch.testing.assert_allclose(m, out[0])
+    sess = onnxruntime.InferenceSession(
+        os.path.join(output_dir, "erb_dec.onnx")
+    )
+    out = sess.run(
+        ("m",),
+        {
+            "emb": emb.numpy(),
+            "e3": e3.numpy(),
+            "e2": e2.numpy(),
+            "e1": e1.numpy(),
+            "e0": e0.numpy(),
+        },
+    )
+    torch.testing.assert_allclose(m, out[0])
 
     print("exporting mask op")
     erb_inverse = erb_fb(state.erb_widths(), p.sr, inverse=True)
@@ -216,14 +213,13 @@ def export(
         os.path.join(output_dir, "df_dec_io"),
         **{"emb": emb, "c0": c0, "coefs": coefs, "alpha": alpha},
     )
-    # NOTE einsum not supported
-    # sess = onnxruntime.InferenceSession(os.path.join(output_dir, "dfnet.onnx"))
-    # out = sess.run(
-    # ("coefs", "alpha"),
-    # {"emb": emb.numpy(), "c0": c0.numpy()},
-    # )
-    # torch.testing.assert_allclose(coefs, out[0])
-    # torch.testing.assert_allclose(alpha, out[1])
+    sess = onnxruntime.InferenceSession(os.path.join(output_dir, "df_dec.onnx"))
+    out = sess.run(
+        ("coefs", "alpha"),
+        {"emb": emb.numpy(), "c0": c0.numpy()},
+    )
+    torch.testing.assert_allclose(coefs, out[0])
+    torch.testing.assert_allclose(alpha, out[1])
 
     print("exporting df-op")
     args = (spec, coefs)  # , alpha)
@@ -318,26 +314,26 @@ def export(
 
     print("running dfop onnx")
     # NOTE ONNX runtime do not support einsum
-    # sess = onnxruntime.InferenceSession(
-    # os.path.join(output_dir, "dfop_step.onnx")
-    # )
-    # spec_d = dfop_delayspec(spec[0, 0])
-    # spec_buf = dfop_initbuf(spec[0, 0]).numpy()
-    # for t in range(spec.shape[2] - p.df_lookahead):
-    # out = sess.run(
-    # ("spec_f", "spec_buf"),
-    # {
-    # "spec": spec_d[t + p.df_lookahead].numpy(),
-    # "coefs": coefs[0, t].numpy(),
-    # "alpha": alpha[0, t].numpy(),
-    # "spec_buf_in": spec_buf,
-    # },
-    # )
-    # spec_buf = out[1]
-    # if t > p.df_lookahead:
-    # torch.testing.assert_allclose(
-    # torch.from_numpy(out[0]), spec_f[0, 0, t]
-    # )
+    sess = onnxruntime.InferenceSession(
+        os.path.join(output_dir, "dfop_step.onnx")
+    )
+    spec_d = dfop_delayspec(spec[0, 0])
+    spec_buf = dfop_initbuf(spec[0, 0]).numpy()
+    for t in range(spec.shape[2] - p.df_lookahead):
+        out = sess.run(
+            ("spec_f", "spec_buf"),
+            {
+                "spec": spec_d[t + p.df_lookahead].numpy(),
+                "coefs": coefs[0, t].numpy(),
+                "alpha": alpha[0, t].numpy(),
+                "spec_buf_in": spec_buf,
+            },
+        )
+        spec_buf = out[1]
+        if t > p.df_lookahead:
+            torch.testing.assert_allclose(
+                torch.from_numpy(out[0]), spec_f[0, 0, t]
+            )
     return
 
     # print("exporting whole dfnet")
