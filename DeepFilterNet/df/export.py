@@ -1,6 +1,9 @@
 import argparse
 import os
 
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+
 import onnx
 import numpy as np
 import onnxruntime
@@ -36,7 +39,17 @@ def export(
     net.eval()
     p = ModelParams()
 
-    audio = torch.randn((1, int(0.1 * p.sr)))
+    # audio = torch.randn((1, int(0.1 * p.sr)))
+    # 100ms
+    audio_duration_ms = 100
+    n_samples = int(audio_duration_ms / 1000 * p.sr)
+    # if ensure it fit hop perfectly
+    # n_residual_frames = n_samples % p.hop_size
+    # real_audio_duration_ms = audio_duration_ms - (n_residual_frames / n_samples)
+    # print("real audio duration ms", real_audio_duration_ms)
+    # n_samples -= n_residual_frames
+    audio = torch.randn((1, n_samples))
+
     spec, feat_erb, feat_spec = df_features(audio, state, nb_df=p.nb_df)
     ic(spec.shape)
     # only use `df_order` steps
@@ -61,6 +74,7 @@ def export(
         input_names=["feat_erb", "feat_spec"],
         dynamic_axes={
             "feat_erb": {2: "time"},
+            "feat_spec": {2: "time"},
             "e0": {2: "time"},
             "e1": {2: "time"},
             "e3": {2: "time"},
@@ -94,8 +108,8 @@ def export(
     )
     sess = onnxruntime.InferenceSession(enc_path)
     out = sess.run(
-        ("e0", "e1", "e2", "e3", "emb", "c0", "lsnr"),
-        {"feat_erb": feat_erb.numpy(), "feat_spec": feat_spec.numpy()},
+    ("e0", "e1", "e2", "e3", "emb", "c0", "lsnr"),
+    {"feat_erb": feat_erb.numpy(), "feat_spec": feat_spec.numpy()},
     )
     torch.testing.assert_allclose(e0, out[0])
     torch.testing.assert_allclose(e1, out[1])
@@ -144,17 +158,17 @@ def export(
         },
     )
     sess = onnxruntime.InferenceSession(
-        os.path.join(output_dir, "erb_dec.onnx")
+    os.path.join(output_dir, "erb_dec.onnx")
     )
     out = sess.run(
-        ("m",),
-        {
-            "emb": emb.numpy(),
-            "e3": e3.numpy(),
-            "e2": e2.numpy(),
-            "e1": e1.numpy(),
-            "e0": e0.numpy(),
-        },
+    ("m",),
+    {
+    "emb": emb.numpy(),
+    "e3": e3.numpy(),
+    "e2": e2.numpy(),
+    "e1": e1.numpy(),
+    "e0": e0.numpy(),
+    },
     )
     torch.testing.assert_allclose(m, out[0])
 
@@ -215,8 +229,8 @@ def export(
     )
     sess = onnxruntime.InferenceSession(os.path.join(output_dir, "df_dec.onnx"))
     out = sess.run(
-        ("coefs", "alpha"),
-        {"emb": emb.numpy(), "c0": c0.numpy()},
+    ("coefs", "alpha"),
+    {"emb": emb.numpy(), "c0": c0.numpy()},
     )
     torch.testing.assert_allclose(coefs, out[0])
     torch.testing.assert_allclose(alpha, out[1])
@@ -313,45 +327,28 @@ def export(
     )
 
     print("running dfop onnx")
-    # NOTE ONNX runtime do not support einsum
     sess = onnxruntime.InferenceSession(
-        os.path.join(output_dir, "dfop_step.onnx")
+    os.path.join(output_dir, "dfop_step.onnx")
     )
     spec_d = dfop_delayspec(spec[0, 0])
     spec_buf = dfop_initbuf(spec[0, 0]).numpy()
     for t in range(spec.shape[2] - p.df_lookahead):
         out = sess.run(
-            ("spec_f", "spec_buf"),
-            {
-                "spec": spec_d[t + p.df_lookahead].numpy(),
-                "coefs": coefs[0, t].numpy(),
-                "alpha": alpha[0, t].numpy(),
-                "spec_buf_in": spec_buf,
-            },
+        ("spec_f", "spec_buf"),
+        {
+        "spec": spec_d[t + p.df_lookahead].numpy(),
+        "coefs": coefs[0, t].numpy(),
+        "alpha": alpha[0, t].numpy(),
+        "spec_buf_in": spec_buf,
+        },
         )
         spec_buf = out[1]
         if t > p.df_lookahead:
             torch.testing.assert_allclose(
-                torch.from_numpy(out[0]), spec_f[0, 0, t]
+            torch.from_numpy(out[0]), spec_f[0, 0, t]
             )
+    print(f"ONNX export done sucessfully in: {output_dir}")
     return
-
-    # print("exporting whole dfnet")
-    # args = (spec, feat_erb, feat_spec, hemb, hdf)
-    # torch.onnx.export(
-    #     model=net,
-    #     args=args,
-    #     input_names=["spec", "feat_erb", "feat_spec"],
-    #     f=os.path.join(output_dir, "dfnet.onnx"),
-    #     do_constant_folding=constant_folding,
-    #     opset_version=opset_version,
-    #     dynamic_axes={
-    #         "spec": {2: "time"},
-    #         "feat_erb": {2: "time"},
-    #         "feat_spec": {2: "time"},
-    #     },
-    #     verbose=False,
-    # )
 
 
 def main():
@@ -361,15 +358,17 @@ def main():
     )
     args = parser.parse_args()
     if not os.path.isdir(args.base_dir):
-        NotADirectoryError(
+        raise NotADirectoryError(
             "Base directory not found at {}".format(args.base_dir)
         )
-    init_logger(file=os.path.join(args.base_dir, "export.log"))
+
+    out_dir = os.path.join(args.base_dir, "export")
+    os.makedirs(out_dir, exist_ok=True)
+
+    init_logger(file=os.path.join(out_dir, "export.log"))
     cfg_path = os.path.join(args.base_dir, "config.ini")
     config.load(cfg_path)
     checkpoint_dir = os.path.join(args.base_dir, "checkpoints")
-    out_dir = os.path.join(args.base_dir, "export")
-    os.makedirs(out_dir, exist_ok=True)
 
     p = ModelParams()
     df_state = DF(
@@ -382,3 +381,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    del os.environ["CUDA_VISIBLE_DEVICES"]
